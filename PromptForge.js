@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Prompt Forge
 // @namespace    local.chatgpt.image-mentions
-// @version      1.6.3
-// @description  Reuse supported files with @mentions and prompt snippets with #tags in ChatGPT.
+// @version      1.8.0
+// @description  Reuse files with @mentions, prompt snippets with #tags, and optional random image pools in ChatGPT.
 // @author       You
 // @match        https://chatgpt.com/*
 // @match        https://www.chatgpt.com/*
@@ -17,11 +17,15 @@
   const DB_VERSION = 2;
   const STORE_NAME = 'images';
   const TAG_STORE_NAME = 'promptTags';
+  const HISTORY_RESTORATIONS_KEY = 'cim-history-restorations';
+  const HISTORY_RESTORATIONS_LIMIT = 40;
+  const HISTORY_RESTORATIONS_MAX_CHARS = 600000;
   const MARKER_RE = /⟦(?:Image|File) reference @([A-Za-z0-9_-]+): ([^⟧]*?)(?: \[ref:([A-Za-z0-9-]+)\])?⟧/g;
   const TAG_MARKER_RE = /⟦Prompt tag #([A-Za-z0-9_-]+): ([^⟧]*?)(?: \[tag:([A-Za-z0-9-]+)\])?⟧/g;
   const MENTION_RE = /(^|\s)@([A-Za-z0-9_-]+)/g;
   const TAG_RE = /(^|\s)#([A-Za-z0-9_-]+)/g;
   const REFERENCE_RE = /(^|\s)([@#])([A-Za-z0-9_-]+)/g;
+  const CHIPPABLE_REFERENCE_RE = /(^|\s)([@#])([A-Za-z0-9_-]+)(?=$|[\s.,!?;:()[\]{}'"“”])/g;
   const SUPPORTED_EXTENSIONS = new Set([
     'png', 'jpg', 'jpeg', 'webp', 'gif',
     'pdf', 'doc', 'docx', 'odt', 'rtf',
@@ -50,6 +54,9 @@
     modalTab: 'files',
     sending: false,
     internalSubmit: false,
+    pendingPlainRestoration: null,
+    historyRestorations: [],
+    editingPlainRestorations: new WeakMap(),
     tooltipTimer: null,
     autocompleteTimer: null,
   };
@@ -130,6 +137,8 @@
       .cim-tag-card .cim-card-name { color:#7657d6; }
       html.dark .cim-tag-card .cim-card-name { color:#b9a5ff; }
       .cim-tag-card .cim-card-note { height:72px; display:-webkit-box; overflow-wrap:anywhere; -webkit-box-orient:vertical; -webkit-line-clamp:5; white-space:pre-wrap; }
+      .cim-tag-pool-badge { width:max-content; margin-top:auto; padding:3px 7px; border-radius:999px; color:#6747c7; background:rgba(118,87,214,.13); font-size:9px; font-weight:700; }
+      html.dark .cim-tag-pool-badge { color:#c9bbff; background:rgba(118,87,214,.22); }
       .cim-tag-glyph { width:42px; height:42px; display:grid; place-items:center; border-radius:8px; color:#7657d6; background:rgba(118,87,214,.13); font-size:23px; font-weight:750; }
       .cim-card-actions { position:absolute; top:12px; right:12px; display:flex; gap:4px; opacity:0; transition:opacity .15s; }
       .cim-card:hover .cim-card-actions, .cim-card:focus-within .cim-card-actions { opacity:1; }
@@ -161,6 +170,23 @@
       .cim-sending { opacity:.55 !important; pointer-events:none !important; }
       .cim-tag-mention, .cim-sent-tag { display:inline-flex; align-items:center; padding:1px 7px 2px; margin:0 1px; max-width:180px; border:1px solid rgba(118,87,214,.32); border-radius:999px; color:#6747c7; background:rgba(118,87,214,.13); font-weight:600; line-height:1.35; vertical-align:baseline; cursor:default; box-decoration-break:clone; -webkit-box-decoration-break:clone; }
       html.dark .cim-tag-mention, html.dark .cim-sent-tag { color:#b9a5ff; background:rgba(118,87,214,.22); }
+      .cim-pool-toggle { display:flex; align-items:flex-start; gap:9px; margin-top:14px; padding:10px; border:1px solid var(--cim-border); border-radius:11px; cursor:pointer; }
+      .cim-pool-toggle input { margin-top:3px; accent-color:#7657d6; }
+      .cim-pool-toggle span { min-width:0; }
+      .cim-pool-toggle strong, .cim-pool-toggle small { display:block; }
+      .cim-pool-toggle strong { font-size:12px; }
+      .cim-pool-toggle small { margin-top:2px; color:var(--cim-muted); font-size:10px; line-height:1.35; }
+      .cim-pool-settings { margin-top:8px; padding:10px; border:1px solid rgba(118,87,214,.25); border-radius:11px; background:rgba(118,87,214,.06); }
+      .cim-pool-heading { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; font-size:11px; font-weight:650; }
+      .cim-pool-count { display:flex; align-items:center; gap:5px; color:var(--cim-muted); font-size:10px; font-weight:600; }
+      .cim-pool-count input { width:48px; padding:4px 5px; border:1px solid var(--cim-border); border-radius:7px; color:var(--cim-text); background:var(--cim-panel); text-align:center; }
+      .cim-pool-grid { max-height:156px; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; overflow:auto; }
+      .cim-pool-option { min-width:0; display:grid; grid-template-columns:auto 34px minmax(0,1fr); align-items:center; gap:6px; padding:5px; border:1px solid var(--cim-border); border-radius:8px; cursor:pointer; }
+      .cim-pool-option:has(input:checked) { border-color:#7657d6; background:rgba(118,87,214,.12); }
+      .cim-pool-option input { accent-color:#7657d6; }
+      .cim-pool-option img { width:34px; height:34px; object-fit:cover; border-radius:6px; }
+      .cim-pool-option span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10px; font-weight:650; }
+      .cim-pool-empty { padding:12px 6px; color:var(--cim-muted); text-align:center; font-size:10px; }
       @media (max-width:680px) { .cim-modal-body { grid-template-columns:1fr; } .cim-editor { border-right:0; border-bottom:1px solid var(--cim-border); } .cim-modal { max-height:94vh; } }
     `;
     document.head.appendChild(style);
@@ -237,6 +263,48 @@
     return text.length > limit ? `${text.slice(0, Math.max(0, limit - 3)).trimEnd()}...` : text;
   }
 
+  function loadHistoryRestorations() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(HISTORY_RESTORATIONS_KEY) || '[]');
+      state.historyRestorations = Array.isArray(parsed)
+        ? parsed.filter((entry) => typeof entry?.expandedText === 'string' && Array.isArray(entry.restorations))
+        : [];
+    } catch (error) {
+      state.historyRestorations = [];
+      console.error('[Prompt Forge] Could not load history chip metadata', error);
+    }
+  }
+
+  function rememberHistoryRestoration(restoration) {
+    if (!restoration?.expandedText || !restoration.restorations?.length) return;
+    const entry = {
+      expandedText: restoration.expandedText,
+      restorations: restoration.restorations.map((item) => ({
+        kind: item.kind, name: item.name, expanded: item.expanded,
+        note: item.note || '', text: item.text || '', id: item.id || '',
+      })),
+      createdAt: Date.now(),
+    };
+    const candidates = [
+      entry,
+      ...state.historyRestorations.filter((item) => item.expandedText !== entry.expandedText),
+    ];
+    const retained = [];
+    let totalChars = 0;
+    for (const candidate of candidates.slice(0, HISTORY_RESTORATIONS_LIMIT)) {
+      const size = JSON.stringify(candidate).length;
+      if (retained.length && totalChars + size > HISTORY_RESTORATIONS_MAX_CHARS) break;
+      retained.push(candidate);
+      totalChars += size;
+    }
+    state.historyRestorations = retained;
+    try {
+      localStorage.setItem(HISTORY_RESTORATIONS_KEY, JSON.stringify(retained));
+    } catch (error) {
+      console.error('[Prompt Forge] Could not persist history chip metadata', error);
+    }
+  }
+
   function shortId() {
     return crypto.randomUUID().replace(/-/g, '').slice(0, 10);
   }
@@ -263,6 +331,11 @@
     return (fileExtension(record) || fileCategory(record)).toLocaleUpperCase();
   }
 
+  function attachmentFileName(record) {
+    const extension = fileExtension(record);
+    return `${record.nickname}${extension ? `.${extension}` : ''}`;
+  }
+
   function isSupportedFile(file) {
     const extension = fileExtension(file);
     if (extension === 'gdoc') return false;
@@ -279,6 +352,11 @@
   function fileVisual(record, small = false) {
     if (fileCategory(record) === 'image') return `<img src="${getObjectUrl(record)}" alt="${escapeHtml(record.nickname || record.fileName || 'Image')}">`;
     return `<div class="cim-file-icon${small ? ' cim-file-icon-small' : ''}" data-type="${fileCategory(record)}"><span>${escapeHtml(fileTypeLabel(record))}</span></div>`;
+  }
+
+  function tagRandomPoolRecords(tag) {
+    const ids = Array.isArray(tag?.randomPoolIds) ? tag.randomPoolIds : [];
+    return ids.map((id) => state.recordById.get(id)).filter((record) => record && fileCategory(record) === 'image');
   }
 
   function sortedRecords(records = state.records) {
@@ -323,7 +401,7 @@
     backdrop.className = 'cim-modal-backdrop cim-hidden';
     backdrop.innerHTML = `
       <section class="cim-modal" role="dialog" aria-modal="true" aria-labelledby="cim-title">
-        <header class="cim-modal-header"><h2 id="cim-title">Mentions library</h2><button type="button" class="cim-icon-button" data-cim-close aria-label="Close">${ICONS.close}</button></header>
+        <header class="cim-modal-header"><h2 id="cim-title">Prompt Forge library</h2><button type="button" class="cim-icon-button" data-cim-close aria-label="Close">${ICONS.close}</button></header>
         <nav class="cim-tabs" aria-label="Mention types">
           <button type="button" data-cim-tab="files" role="tab" aria-selected="true">@ Files &amp; images</button>
           <button type="button" data-cim-tab="tags" role="tab" aria-selected="false"># Prompt tags</button>
@@ -350,8 +428,14 @@
           <form class="cim-editor" id="cim-tag-form">
             <label class="cim-field"><span>Tag name</span><input id="cim-tag-name" maxlength="40" autocomplete="off" placeholder="polish-writing" required pattern="[A-Za-z0-9_-]+"></label>
             <p class="cim-help">Use letters, numbers, underscores, or hyphens. Type <b>#tag-name</b> in ChatGPT.</p>
-            <label class="cim-field"><span>Reusable prompt snippet</span><textarea id="cim-tag-text" rows="12" maxlength="12000" required placeholder="Rewrite the following for clarity and concision. Preserve the original meaning and return only the revised text."></textarea></label>
+            <label class="cim-field"><span>Reusable prompt snippet</span><textarea id="cim-tag-text" rows="8" maxlength="12000" required placeholder="Rewrite the following for clarity and concision. Preserve the original meaning and return only the revised text."></textarea></label>
             <p class="cim-help">Type <b>@</b> here to include saved files or images. Calling this #tag will attach and reference them automatically.</p>
+            <label class="cim-pool-toggle"><input id="cim-tag-random-enabled" type="checkbox"><span><strong>Choose random images when this tag is used</strong><small>Build a pool from your saved images and draw a fresh sample for every prompt.</small></span></label>
+            <div class="cim-pool-settings cim-hidden" id="cim-tag-random-settings">
+              <div class="cim-pool-heading"><span>Image pool</span><label class="cim-pool-count">Choose <input id="cim-tag-random-count" type="number" min="1" value="1"> per use</label></div>
+              <div class="cim-pool-grid" id="cim-tag-random-pool"></div>
+              <p class="cim-help" id="cim-tag-random-summary">Select at least one saved image.</p>
+            </div>
             <div class="cim-form-actions"><button class="cim-primary" id="cim-tag-save" type="submit">Save prompt tag</button><button class="cim-secondary cim-hidden" data-cancel-tag-edit type="button">Cancel edit</button></div>
           </form>
           <section class="cim-library">
@@ -383,6 +467,9 @@
     }));
     backdrop.querySelector('[data-cancel-file-edit]').addEventListener('click', () => { resetEditor(); document.querySelector('#cim-nickname')?.focus(); });
     backdrop.querySelector('[data-cancel-tag-edit]').addEventListener('click', () => { resetTagEditor(); document.querySelector('#cim-tag-name')?.focus(); });
+    backdrop.querySelector('#cim-tag-random-enabled').addEventListener('change', updateTagRandomPoolState);
+    backdrop.querySelector('#cim-tag-random-count').addEventListener('input', updateTagRandomPoolState);
+    backdrop.querySelector('#cim-tag-random-pool').addEventListener('change', updateTagRandomPoolState);
     backdrop.addEventListener('mousedown', (event) => { if (event.target === backdrop) closeModal(); });
     dropzone.addEventListener('click', () => fileInput.click());
     dropzone.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') fileInput.click(); });
@@ -412,6 +499,7 @@
     closeAutocomplete();
     resetEditor();
     resetTagEditor();
+    requestAnimationFrame(() => hydrateStoredReferences(getEditor()));
   }
 
   function switchModalTab(tab) {
@@ -480,9 +568,10 @@
       await loadRecords();
       resetEditor();
       renderLibrary();
+      refreshTagRandomPool();
       toast(`Saved @${nickname}`);
     } catch (error) {
-      console.error('[File Mentions] Save failed', error);
+      console.error('[Prompt Forge] Save failed', error);
       toast('Could not save the file. Browser storage may be full.');
     }
   }
@@ -533,6 +622,7 @@
     await loadRecords();
     if (state.editingId === id) resetEditor();
     renderLibrary();
+    refreshTagRandomPool();
     toast(`Deleted @${record.nickname}`);
   }
 
@@ -541,21 +631,77 @@
     const form = document.querySelector('#cim-tag-form');
     if (!form) return;
     form.reset();
+    renderTagRandomPool([]);
     form.querySelector('#cim-tag-save').textContent = 'Save prompt tag';
     form.querySelector('[data-cancel-tag-edit]')?.classList.add('cim-hidden');
+  }
+
+  function selectedTagRandomPoolIds() {
+    return [...document.querySelectorAll('#cim-tag-random-pool input[type="checkbox"]:checked')].map((input) => input.value);
+  }
+
+  function renderTagRandomPool(selectedIds = selectedTagRandomPoolIds()) {
+    const grid = document.querySelector('#cim-tag-random-pool');
+    if (!grid) return;
+    const selected = new Set(selectedIds);
+    const images = sortedRecords(state.records.filter((record) => fileCategory(record) === 'image'));
+    grid.innerHTML = images.length ? images.map((record) => `
+      <label class="cim-pool-option" title="@${escapeHtml(record.nickname)}">
+        <input type="checkbox" value="${escapeHtml(record.id)}"${selected.has(record.id) ? ' checked' : ''}>
+        ${fileVisual(record, true)}
+        <span>@${escapeHtml(record.nickname)}</span>
+      </label>`).join('') : '<div class="cim-pool-empty">Add an image to your file library to create a random pool.</div>';
+    updateTagRandomPoolState();
+  }
+
+  function refreshTagRandomPool() {
+    const enabled = document.querySelector('#cim-tag-random-enabled')?.checked;
+    const count = document.querySelector('#cim-tag-random-count')?.value;
+    const selectedIds = selectedTagRandomPoolIds();
+    renderTagRandomPool(selectedIds);
+    const enabledInput = document.querySelector('#cim-tag-random-enabled');
+    const countInput = document.querySelector('#cim-tag-random-count');
+    if (enabledInput) enabledInput.checked = Boolean(enabled);
+    if (countInput && count) countInput.value = count;
+    updateTagRandomPoolState();
+  }
+
+  function updateTagRandomPoolState() {
+    const enabledInput = document.querySelector('#cim-tag-random-enabled');
+    const settings = document.querySelector('#cim-tag-random-settings');
+    const countInput = document.querySelector('#cim-tag-random-count');
+    const summary = document.querySelector('#cim-tag-random-summary');
+    if (!enabledInput || !settings || !countInput || !summary) return;
+    settings.classList.toggle('cim-hidden', !enabledInput.checked);
+    const selectedCount = selectedTagRandomPoolIds().length;
+    const maximum = Math.max(1, selectedCount);
+    countInput.max = String(maximum);
+    countInput.value = String(Math.min(maximum, Math.max(1, Number(countInput.value) || 1)));
+    countInput.disabled = selectedCount === 0;
+    summary.textContent = selectedCount
+      ? `${selectedCount} image${selectedCount === 1 ? '' : 's'} in the pool; ${countInput.value} will be chosen and attached per use.`
+      : 'Select at least one saved image.';
   }
 
   async function saveTagEditor(event) {
     event.preventDefault();
     const name = document.querySelector('#cim-tag-name').value.trim().replace(/^#/, '');
     const text = document.querySelector('#cim-tag-text').value.trim().replace(/[⟦⟧]/g, '');
+    const randomEnabled = document.querySelector('#cim-tag-random-enabled').checked;
+    const randomPoolIds = randomEnabled ? selectedTagRandomPoolIds() : [];
     if (!/^[A-Za-z0-9_-]{1,40}$/.test(name)) return toast('Tag names can only contain letters, numbers, underscores, and hyphens.');
     if (!text) return toast('Enter the reusable prompt snippet.');
+    if (randomEnabled && !randomPoolIds.length) return toast('Select at least one image for the random pool.');
+    const randomPoolCount = randomEnabled
+      ? Math.min(randomPoolIds.length, Math.max(1, Number(document.querySelector('#cim-tag-random-count').value) || 1))
+      : 0;
     const duplicate = state.tagByName.get(name.toLocaleLowerCase());
     if (duplicate && duplicate.id !== state.editingTagId) return toast(`#${name} is already in your library.`);
     const old = state.editingTagId ? state.tagById.get(state.editingTagId) : null;
     const tag = {
+      ...(old || {}),
       id: old?.id || shortId(), name, nameLower: name.toLocaleLowerCase(), text,
+      randomPoolIds, randomPoolCount,
       createdAt: old?.createdAt || Date.now(), updatedAt: Date.now(),
     };
     try {
@@ -565,7 +711,7 @@
       renderTagLibrary();
       toast(`Saved #${name}`);
     } catch (error) {
-      console.error('[File Mentions] Prompt tag save failed', error);
+      console.error('[Prompt Forge] Prompt tag save failed', error);
       toast('Could not save the prompt tag.');
     }
   }
@@ -583,6 +729,7 @@
       <article class="cim-card cim-tag-card" data-id="${tag.id}">
         <div class="cim-card-actions"><button type="button" data-edit-tag aria-label="Edit #${escapeHtml(tag.name)}">${ICONS.edit}</button><button type="button" data-delete-tag aria-label="Delete #${escapeHtml(tag.name)}">${ICONS.trash}</button></div>
         <div class="cim-card-name">#${escapeHtml(tag.name)}</div><div class="cim-card-note">${escapeHtml(truncatePreview(tag.text, 180))}</div>
+        ${tagRandomPoolRecords(tag).length ? `<div class="cim-tag-pool-badge">Random images · ${Math.min(tag.randomPoolCount || 1, tagRandomPoolRecords(tag).length)} of ${tagRandomPoolRecords(tag).length}</div>` : ''}
       </article>`).join('');
     grid.querySelectorAll('[data-edit-tag]').forEach((button) => button.addEventListener('click', () => editTag(button.closest('.cim-tag-card').dataset.id)));
     grid.querySelectorAll('[data-delete-tag]').forEach((button) => button.addEventListener('click', () => deleteTag(button.closest('.cim-tag-card').dataset.id)));
@@ -598,6 +745,10 @@
     state.editingTagId = id;
     document.querySelector('#cim-tag-name').value = tag.name;
     document.querySelector('#cim-tag-text').value = tag.text;
+    const poolRecords = tagRandomPoolRecords(tag);
+    document.querySelector('#cim-tag-random-enabled').checked = poolRecords.length > 0;
+    document.querySelector('#cim-tag-random-count').value = String(Math.min(tag.randomPoolCount || 1, Math.max(1, poolRecords.length)));
+    renderTagRandomPool(poolRecords.map((record) => record.id));
     document.querySelector('#cim-tag-save').textContent = 'Update prompt tag';
     document.querySelector('[data-cancel-tag-edit]')?.classList.remove('cim-hidden');
     document.querySelector('#cim-tag-name').focus();
@@ -620,7 +771,7 @@
     button.type = 'button';
     button.className = `${plus.className || 'composer-btn'} cim-library-button`;
     button.setAttribute('aria-label', 'Open mentions library');
-    button.title = 'File mentions and prompt tags';
+    button.title = 'Prompt Forge files and prompt tags';
     button.innerHTML = ICONS.file;
     button.addEventListener('click', openModal);
     const host = plus.parentElement?.parentElement || plus.parentElement;
@@ -717,7 +868,7 @@
       </div>` : '<div class="cim-tag-menu-title">Recent & available prompt tags</div>'}
       <div class="cim-options">${state.autocomplete.items.map((tag, index) => `
         <button type="button" class="cim-option" data-index="${index}" aria-selected="${index === state.autocomplete.selected}">
-          <span class="cim-tag-glyph">#</span><span><strong>#${escapeHtml(tag.name)}</strong><small>${escapeHtml(truncatePreview(tag.text, 90))}</small></span>
+          <span class="cim-tag-glyph">#</span><span><strong>#${escapeHtml(tag.name)}</strong><small>${escapeHtml(truncatePreview(tag.text, 90))}${tagRandomPoolRecords(tag).length ? ` · Random ${Math.min(tag.randomPoolCount || 1, tagRandomPoolRecords(tag).length)} of ${tagRandomPoolRecords(tag).length}` : ''}</small></span>
         </button>`).join('')}</div>` : `
       ${state.autocomplete.query ? `<div class="cim-sortbar" aria-label="Sort file mentions"><span>Sort</span>
         <button type="button" data-sort="name" aria-pressed="${state.sortMode === 'name'}">Name</button>
@@ -839,6 +990,53 @@
     editor.focus();
   }
 
+  function hydrateStoredReferences(editor = getEditor()) {
+    if (!editor) return 0;
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        return node.parentElement?.closest('.cim-mention, .cim-tag-mention, .cim-sent-mention, .cim-sent-tag')
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const replacements = [];
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      CHIPPABLE_REFERENCE_RE.lastIndex = 0;
+      for (const match of node.data.matchAll(CHIPPABLE_REFERENCE_RE)) {
+        const isTag = match[2] === '#';
+        const item = isTag
+          ? state.tagByName.get(match[3].toLocaleLowerCase())
+          : state.recordByNickname.get(match[3].toLocaleLowerCase());
+        if (!item) continue;
+        const start = match.index + match[1].length;
+        replacements.push({ node, start, end: start + match[2].length + match[3].length, isTag, item });
+      }
+    }
+    for (const replacement of replacements.reverse()) {
+      if (!replacement.node.isConnected) continue;
+      const range = document.createRange();
+      range.setStart(replacement.node, replacement.start);
+      range.setEnd(replacement.node, replacement.end);
+      range.deleteContents();
+      const chip = document.createElement('span');
+      chip.className = replacement.isTag ? 'cim-tag-mention' : 'cim-mention';
+      chip.contentEditable = 'false';
+      if (replacement.isTag) {
+        chip.dataset.cimTagId = replacement.item.id;
+        chip.textContent = `#${replacement.item.name}`;
+      } else {
+        chip.dataset.cimId = replacement.item.id;
+        chip.textContent = `@${replacement.item.nickname}`;
+      }
+      range.insertNode(chip);
+    }
+    if (replacements.length) {
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: null }));
+    }
+    return replacements.length;
+  }
+
   function handleEditorKeydown(event) {
     if (state.autocomplete.open) {
       if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
@@ -902,30 +1100,44 @@
     return [...found.values()];
   }
 
+  function randomSample(items, count) {
+    const shuffled = [...items];
+    for (let index = shuffled.length - 1; index > 0; index -= 1) {
+      const random = crypto.getRandomValues(new Uint32Array(1))[0] % (index + 1);
+      [shuffled[index], shuffled[random]] = [shuffled[random], shuffled[index]];
+    }
+    return shuffled.slice(0, Math.min(shuffled.length, Math.max(0, count)));
+  }
+
   function resolvePromptDependencies(text) {
     const records = new Map();
     const tags = new Map();
     const visited = new Set();
+    const randomSelections = new Map();
+    const visitRecord = (record) => {
+      records.set(record.id, record);
+      const key = `file:${record.id}`;
+      if (visited.has(key)) return;
+      visited.add(key);
+      visitText(record.note || '');
+    };
+    const visitTag = (tag) => {
+      tags.set(tag.id, tag);
+      const key = `tag:${tag.id}`;
+      if (visited.has(key)) return;
+      visited.add(key);
+      visitText(tag.text || '');
+      const pool = tagRandomPoolRecords(tag);
+      const selected = randomSample(pool, Math.min(tag.randomPoolCount || 1, pool.length));
+      randomSelections.set(tag.id, selected);
+      selected.forEach(visitRecord);
+    };
     const visitText = (value) => {
-      for (const record of collectMentionedRecords(value)) {
-        records.set(record.id, record);
-        const key = `file:${record.id}`;
-        if (!visited.has(key)) {
-          visited.add(key);
-          visitText(record.note || '');
-        }
-      }
-      for (const tag of collectMentionedTags(value)) {
-        tags.set(tag.id, tag);
-        const key = `tag:${tag.id}`;
-        if (!visited.has(key)) {
-          visited.add(key);
-          visitText(tag.text || '');
-        }
-      }
+      collectMentionedRecords(value).forEach(visitRecord);
+      collectMentionedTags(value).forEach(visitTag);
     };
     visitText(text);
-    return { records: [...records.values()], tags: [...tags.values()] };
+    return { records: [...records.values()], tags: [...tags.values()], randomSelections };
   }
 
   async function markMentionsUsed(records, tags) {
@@ -946,7 +1158,7 @@
     try {
       await Promise.all(writes);
     } catch (error) {
-      console.error('[File Mentions] Could not persist mention usage ranking', error);
+      console.error('[Prompt Forge] Could not persist mention usage ranking', error);
     }
   }
 
@@ -965,39 +1177,75 @@
     return collectMentionedRecords(text).length > 0 || collectMentionedTags(text).length > 0;
   }
 
-  function expandedPrompt(text, records, tags) {
-    const byName = new Map(records.map((record) => [record.nicknameLower, record]));
-    const tagsByName = new Map(tags.map((tag) => [tag.nameLower, tag]));
-    return expandReferences(text, byName, tagsByName, new Set());
+  function expandedPrompt(text, records, tags, randomSelections = new Map()) {
+    const context = {
+      byName: new Map(records.map((record) => [record.nicknameLower, record])),
+      tagsByName: new Map(tags.map((tag) => [tag.nameLower, tag])),
+      randomSelections,
+    };
+    const restorations = [];
+    return { text: expandReferences(text, context, new Set(), restorations), restorations };
   }
 
-  function expandReferences(text, byName, tagsByName, stack) {
+  function expandReferences(text, context, stack, restorations) {
     return text.replace(REFERENCE_RE, (whole, prefix, trigger, name) => {
       if (trigger === '@') {
-        const record = byName.get(name.toLocaleLowerCase());
+        const record = context.byName.get(name.toLocaleLowerCase());
         if (!record) return whole;
-        return `${prefix}${expandedFileReference(record, byName, tagsByName, stack)}`;
+        const expanded = expandedFileReference(record, context, stack);
+        restorations.push({ kind: 'file', name: record.nickname, expanded, note: record.note || '', id: record.id });
+        return `${prefix}${expanded}`;
       }
-      const tag = tagsByName.get(name.toLocaleLowerCase());
-      return tag ? `${prefix}${expandedTagReference(tag, byName, tagsByName, stack)}` : whole;
+      const tag = context.tagsByName.get(name.toLocaleLowerCase());
+      if (!tag) return whole;
+      const expanded = expandedTagReference(tag, context, stack);
+      restorations.push({ kind: 'tag', name: tag.name, expanded, text: tag.text, id: tag.id });
+      return `${prefix}${expanded}`;
     });
   }
 
-  function expandedFileReference(record, byName, tagsByName, stack) {
-    const note = record.note || `Use the attached ${fileTypeLabel(record)} file named "${record.nickname}" as a reference.`;
+  function plainFileReference(record, context, stack) {
     const key = `file:${record.id}`;
-    if (stack.has(key)) return `@${record.nickname}`;
+    if (stack.has(key)) return attachmentFileName(record);
     const nextStack = new Set(stack);
     nextStack.add(key);
-    return `⟦File reference @${record.nickname}: ${expandReferences(note, byName, tagsByName, nextStack)}⟧`;
+    const guidance = record.note
+      ? renderPlainReferences(record.note, context, nextStack).trim().replace(/[.!?]+$/, '')
+      : '';
+    const fileName = attachmentFileName(record);
+    return guidance ? `${fileName} — ${guidance}` : fileName;
   }
 
-  function expandedTagReference(tag, byName, tagsByName, stack) {
+  function plainTagReference(tag, context, stack) {
     const key = `tag:${tag.id}`;
     if (stack.has(key)) return `#${tag.name}`;
     const nextStack = new Set(stack);
     nextStack.add(key);
-    return `⟦Prompt tag #${tag.name}: ${expandReferences(tag.text, byName, tagsByName, nextStack)}⟧`;
+    const instruction = renderPlainReferences(tag.text, context, nextStack);
+    const selected = context.randomSelections.get(tag.id) || [];
+    const randomSection = selected.length
+      ? `\nImages: ${selected.map((record) => plainFileReference(record, context, nextStack)).join('; ')}`
+      : '';
+    return `${instruction}${randomSection}`;
+  }
+
+  function renderPlainReferences(text, context, stack) {
+    return text.replace(REFERENCE_RE, (whole, prefix, trigger, name) => {
+      if (trigger === '@') {
+        const record = context.byName.get(name.toLocaleLowerCase());
+        return record ? `${prefix}${plainFileReference(record, context, stack)}` : whole;
+      }
+      const tag = context.tagsByName.get(name.toLocaleLowerCase());
+      return tag ? `${prefix}${plainTagReference(tag, context, stack)}` : whole;
+    });
+  }
+
+  function expandedFileReference(record, context, stack) {
+    return plainFileReference(record, context, stack);
+  }
+
+  function expandedTagReference(tag, context, stack) {
+    return plainTagReference(tag, context, stack);
   }
 
   function setEditorText(editor, text) {
@@ -1027,7 +1275,7 @@
     const transfer = new DataTransfer();
     for (const file of input.files || []) transfer.items.add(file);
     for (const record of records) {
-      transfer.items.add(new File([record.blob], record.fileName || record.nickname, {
+      transfer.items.add(new File([record.blob], attachmentFileName(record), {
         type: record.mimeType || record.blob.type || 'application/octet-stream', lastModified: record.lastModified || Date.now(),
       }));
     }
@@ -1057,10 +1305,17 @@
     closeAutocomplete();
     document.querySelectorAll('.cim-library-button').forEach((button) => button.classList.add('cim-sending'));
     try {
-      setEditorText(editor, expandedPrompt(originalText, records, tags));
+      const expansion = expandedPrompt(originalText, records, tags, dependencies.randomSelections);
+      setEditorText(editor, expansion.text);
       if (records.length) await attachRecords(form, records);
       const send = form.querySelector('#composer-submit-button, [data-testid="send-button"]');
       if (!send || send.disabled) throw new Error('ChatGPT send button is not ready.');
+      state.pendingPlainRestoration = {
+        expandedText: expansion.text,
+        restorations: expansion.restorations,
+        expiresAt: Date.now() + 10000,
+      };
+      rememberHistoryRestoration(state.pendingPlainRestoration);
       state.internalSubmit = true;
       send.click();
       void markMentionsUsedAfterSend(editor, records, tags);
@@ -1070,7 +1325,8 @@
       toast(`Expanded ${parts.join(' and ')} from your mentions`);
       setTimeout(processSentMarkers, 250);
     } catch (error) {
-      console.error('[File Mentions] Send failed', error);
+      console.error('[Prompt Forge] Send failed', error);
+      state.pendingPlainRestoration = null;
       setEditorText(editor, originalText);
       toast(error.message || 'Could not attach the mentioned file.');
     } finally {
@@ -1095,6 +1351,30 @@
     event.preventDefault();
     event.stopImmediatePropagation();
     prepareAndSend();
+  }
+
+  function createSentFileChip(nickname, note = '', id = '', expanded = '') {
+    const chip = document.createElement('span');
+    const record = state.recordByNickname.get(nickname.toLocaleLowerCase());
+    chip.className = 'cim-sent-mention';
+    chip.dataset.cimId = id || record?.id || '';
+    chip.dataset.cimNickname = nickname;
+    chip.dataset.cimNote = note;
+    chip.dataset.cimExpanded = expanded;
+    chip.textContent = `@${nickname}`;
+    return chip;
+  }
+
+  function createSentTagChip(name, text = '', id = '', expanded = '') {
+    const chip = document.createElement('span');
+    const tag = state.tagByName.get(name.toLocaleLowerCase());
+    chip.className = 'cim-sent-tag';
+    chip.dataset.cimTagId = id || tag?.id || '';
+    chip.dataset.cimTagName = name;
+    chip.dataset.cimTagText = text;
+    chip.dataset.cimExpanded = expanded;
+    chip.textContent = `#${name}`;
+    return chip;
   }
 
   function processSentMarkers() {
@@ -1160,32 +1440,166 @@
       node.replaceWith(fragment);
     }
     replaceMarkersAcrossMessages(root);
+    restorePendingPlainReferences(root);
+    restoreStoredHistoryReferences(root);
+    restoreExitedEditingReferences(root);
   }
 
   function replaceMarkersAcrossMessages(root) {
     root.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]').forEach((message) => {
       replaceMarkerAcrossElement(message, MARKER_RE, (match) => {
-        const chip = document.createElement('span');
-        chip.className = 'cim-sent-mention';
-        const record = state.recordByNickname.get(match[1].toLocaleLowerCase());
-        chip.dataset.cimId = match[3] || record?.id || '';
-        chip.dataset.cimNickname = match[1];
-        chip.dataset.cimNote = match[2];
-        chip.textContent = `@${match[1]}`;
-        return chip;
+        return createSentFileChip(match[1], match[2], match[3]);
       });
       replaceMarkerAcrossElement(message, TAG_MARKER_RE, (match) => {
-        const chip = document.createElement('span');
-        chip.className = 'cim-sent-tag';
-        const tag = state.tagByName.get(match[1].toLocaleLowerCase());
-        chip.dataset.cimTagId = match[3] || tag?.id || '';
-        chip.dataset.cimTagName = match[1];
-        chip.dataset.cimTagText = match[2];
-        chip.textContent = `#${match[1]}`;
-        return chip;
+        return createSentTagChip(match[1], match[2], match[3]);
       });
     });
     cleanupLegacyMarkerTails(root);
+  }
+
+  function restorePendingPlainReferences(root) {
+    const pending = state.pendingPlainRestoration;
+    if (!pending) return;
+    if (Date.now() > pending.expiresAt) {
+      state.pendingPlainRestoration = null;
+      return;
+    }
+    const messages = [...root.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]')];
+    const message = messages.at(-1);
+    if (!message || !findPlainText(readRestorableText(message), pending.expandedText)) return;
+    const remaining = [];
+    for (const item of pending.restorations) {
+      const chip = item.kind === 'tag'
+        ? () => createSentTagChip(item.name, item.text, item.id, item.expanded)
+        : () => createSentFileChip(item.name, item.note, item.id, item.expanded);
+      if (!replaceFirstPlainText(message, item.expanded, chip)) remaining.push(item);
+    }
+    state.pendingPlainRestoration = remaining.length ? { ...pending, restorations: remaining } : null;
+  }
+
+  function restoreStoredHistoryReferences(root) {
+    if (!state.historyRestorations.length) return;
+    const messages = [...root.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]')];
+    for (const message of messages) {
+      if (message.dataset.cimEditingExpanded === 'true') continue;
+      const editables = [
+        ...(message.matches('[contenteditable="true"]') ? [message] : []),
+        ...message.querySelectorAll('[contenteditable="true"]'),
+      ];
+      for (const editable of editables) {
+        if (editable.querySelector('.cim-sent-mention, .cim-sent-tag')) continue;
+        restoreHistoryIntoElement(editable);
+      }
+      if (editables.length || message.querySelector('.cim-sent-mention, .cim-sent-tag')) continue;
+      restoreHistoryIntoElement(message);
+    }
+  }
+
+  function restoreHistoryIntoElement(element) {
+    const text = readRestorableText(element);
+    const restoration = state.historyRestorations.find((entry) => findPlainText(text, entry.expandedText));
+    if (!restoration) return false;
+    let restored = false;
+    for (const item of restoration.restorations) {
+      const chip = item.kind === 'tag'
+        ? () => createSentTagChip(item.name, item.text, item.id, item.expanded)
+        : () => createSentFileChip(item.name, item.note, item.id, item.expanded);
+      restored = replaceFirstPlainText(element, item.expanded, chip) || restored;
+    }
+    return restored;
+  }
+
+  function expandSentChipForEditing(chip) {
+    const editable = chip.closest('[contenteditable="true"]');
+    const message = chip.closest('[data-message-author-role="user"], article[data-turn="user"]');
+    const expanded = chip.dataset.cimExpanded;
+    if (!editable || !message || !expanded) return false;
+    const item = chip.matches('.cim-sent-tag')
+      ? {
+        kind: 'tag', name: chip.dataset.cimTagName || chip.textContent.replace(/^#/, ''),
+        text: chip.dataset.cimTagText || '', id: chip.dataset.cimTagId || '', expanded,
+      }
+      : {
+        kind: 'file', name: chip.dataset.cimNickname || chip.textContent.replace(/^@/, ''),
+        note: chip.dataset.cimNote || '', id: chip.dataset.cimId || '', expanded,
+      };
+    const editingItems = state.editingPlainRestorations.get(message) || [];
+    editingItems.push(item);
+    state.editingPlainRestorations.set(message, editingItems);
+    message.dataset.cimEditingExpanded = 'true';
+    const text = document.createTextNode(expanded);
+    chip.replaceWith(text);
+    const selection = getSelection();
+    const range = document.createRange();
+    range.setStartAfter(text);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    editable.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText', data: expanded }));
+    editable.focus();
+    return true;
+  }
+
+  function restoreExitedEditingReferences(root) {
+    root.querySelectorAll('[data-cim-editing-expanded="true"]').forEach((message) => {
+      if (message.querySelector('[contenteditable="true"]')) return;
+      const items = state.editingPlainRestorations.get(message) || [];
+      for (const item of items) {
+        const chip = item.kind === 'tag'
+          ? () => createSentTagChip(item.name, item.text, item.id, item.expanded)
+          : () => createSentFileChip(item.name, item.note, item.id, item.expanded);
+        replaceFirstPlainText(message, item.expanded, chip);
+      }
+      state.editingPlainRestorations.delete(message);
+      delete message.dataset.cimEditingExpanded;
+    });
+  }
+
+  function readRestorableText(element) {
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        return node.parentElement?.closest('button, .cim-sent-mention, .cim-sent-tag') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    let text = '';
+    while (walker.nextNode()) text += walker.currentNode.data;
+    return text.replace(/\u00a0/g, ' ');
+  }
+
+  function replaceFirstPlainText(element, value, makeChip) {
+    if (!value) return false;
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        return node.parentElement?.closest('button, .cim-sent-mention, .cim-sent-tag') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const textNodes = [];
+    let text = '';
+    while (walker.nextNode()) {
+      textNodes.push({ node: walker.currentNode, start: text.length, end: text.length + walker.currentNode.data.length });
+      text += walker.currentNode.data;
+    }
+    const match = findPlainText(text, value);
+    if (!match) return false;
+    const index = match.index;
+    const endOffset = index + match.length;
+    const start = textNodes.find((entry) => index >= entry.start && index < entry.end);
+    const end = [...textNodes].reverse().find((entry) => endOffset > entry.start && endOffset <= entry.end);
+    if (!start || !end || !start.node.isConnected || !end.node.isConnected) return false;
+    const range = document.createRange();
+    range.setStart(start.node, index - start.start);
+    range.setEnd(end.node, endOffset - end.start);
+    range.deleteContents();
+    range.insertNode(makeChip());
+    return true;
+  }
+
+  function findPlainText(text, value) {
+    const parts = String(value || '').trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) return null;
+    const source = parts.map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*');
+    const match = new RegExp(source).exec(text);
+    return match ? { index: match.index, length: match[0].length } : null;
   }
 
   function cleanupLegacyMarkerTails(root) {
@@ -1237,9 +1651,13 @@
       const tag = state.tagById.get(target.dataset.cimTagId) || state.tagByName.get((target.dataset.cimTagName || target.textContent.slice(1)).toLocaleLowerCase());
       const name = tag?.name || target.dataset.cimTagName || target.textContent.replace(/^#/, '');
       const text = tag?.text || target.dataset.cimTagText || 'Saved prompt snippet';
+      const poolRecords = tagRandomPoolRecords(tag);
+      const poolSummary = poolRecords.length
+        ? `<p><b>Random image pool:</b> chooses ${Math.min(tag.randomPoolCount || 1, poolRecords.length)} of ${poolRecords.length} per use<br>${poolRecords.map((record) => `@${escapeHtml(record.nickname)}`).join(', ')}</p>`
+        : '';
       const tooltip = document.querySelector('.cim-tooltip');
       if (!tooltip) return;
-      tooltip.innerHTML = `<strong>#${escapeHtml(name)}</strong><p>${escapeHtml(text)}</p>`;
+      tooltip.innerHTML = `<strong>#${escapeHtml(name)}</strong><p>${escapeHtml(text)}</p>${poolSummary}`;
       tooltip.classList.remove('cim-hidden');
       positionTooltip(tooltip, target);
       return;
@@ -1334,7 +1752,17 @@
       if (event.target.closest?.('#prompt-textarea[contenteditable="true"], div.ProseMirror[contenteditable="true"]')) handleEditorKeydown(event);
       if (event.key === 'Escape' && !document.querySelector('.cim-modal-backdrop')?.classList.contains('cim-hidden')) closeModal();
     }, true);
+    document.addEventListener('focusout', (event) => {
+      const editor = event.target.closest?.('#prompt-textarea[contenteditable="true"], div.ProseMirror[contenteditable="true"]');
+      if (editor) requestAnimationFrame(() => hydrateStoredReferences(editor));
+    }, true);
     document.addEventListener('click', interceptClick, true);
+    document.addEventListener('click', (event) => {
+      const chip = event.target.closest?.('.cim-sent-mention, .cim-sent-tag');
+      if (!chip || !expandSentChipForEditing(chip)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
     document.addEventListener('submit', interceptSubmit, true);
     document.addEventListener('mouseover', (event) => {
       const mention = event.target.closest?.('.cim-mention, .cim-sent-mention, .cim-tag-mention, .cim-sent-tag');
@@ -1351,8 +1779,10 @@
   async function init() {
     ensureUserscriptUi();
     bindGlobalEvents();
-    try { await Promise.all([loadRecords(), loadTags()]); } catch (error) { console.error('[File Mentions] Storage initialization failed', error); toast('Mentions could not open browser storage.'); }
+    loadHistoryRestorations();
+    try { await Promise.all([loadRecords(), loadTags()]); } catch (error) { console.error('[Prompt Forge] Storage initialization failed', error); toast('Prompt Forge could not open browser storage.'); }
     ensureComposerButton();
+    hydrateStoredReferences(getEditor());
     processSentMarkers();
     let scheduled = false;
     new MutationObserver(() => {
