@@ -1,54 +1,151 @@
-# ChatGPT File Mentions and Prompt Tags
+<div align="center">
 
-`ChatGPT-Image-Mentions.user.js` is a browser userscript built against the ChatGPT composer captured in `ChatGPT.htm`. Despite the original filename, it supports images, ChatGPT-compatible files, and reusable prompt snippets.
+# 🔨 Prompt Forge
 
-## Install
+### Reusable files, references, and prompt snippets for ChatGPT
 
-1. Install Tampermonkey, Violentmonkey, or another userscript manager.
+![Version](https://img.shields.io/badge/version-1.6.3-8b5cf6?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-ChatGPT-10a37f?style=flat-square)
+![Type](https://img.shields.io/badge/type-userscript-334155?style=flat-square)
+
+</div>
+
+Prompt Forge is a browser userscript that adds a local library of reusable files
+and prompt snippets to the ChatGPT composer. Reference a file with `@nickname` or
+insert a saved prompt with `#tag`—Prompt Forge handles the rest when you send.
+
+> [!NOTE]
+> Prompt Forge was built against the ChatGPT composer captured in `ChatGPT.htm`.
+> It uses stable composer identifiers with fallback selectors for minor site updates.
+
+## ✨ Features
+
+| Feature | What it does |
+| --- | --- |
+| **File mentions** | Save supported files once and reuse them with `@nickname`. |
+| **Prompt tags** | Store reusable prompt snippets and invoke them with `#tag`. |
+| **Smart autocomplete** | Shows up to three matching or recently used entries above the composer. |
+| **Nested references** | Prompt tags can reference files, and file notes can reference prompt tags. |
+| **Local previews** | Hover sent chips to inspect notes, snippets, images, or downloadable files. |
+| **Private local storage** | Keeps your library in IndexedDB until a referenced file is sent. |
+
+## 🚀 Install
+
+1. Install [Tampermonkey](https://www.tampermonkey.net/),
+   [Violentmonkey](https://violentmonkey.github.io/), or another userscript manager.
 2. Create a new userscript.
-3. Replace its contents with `ChatGPT-Image-Mentions.user.js` and save.
-4. Open or refresh <https://chatgpt.com/>.
+3. Replace its contents with [`PromptForge.js`](./PromptForge.js) and save.
+4. Open or refresh [ChatGPT](https://chatgpt.com/).
 
-## Use
+## 📎 Use file mentions
 
-1. Select the file-library button next to ChatGPT's **Add files** button.
-2. Add a supported file, give it a nickname, and optionally add the reference note that ChatGPT should receive.
-3. In the prompt, type `@` and part of a nickname. Up to three matches appear above the typing bar; pick one with the mouse or the arrow keys and Enter/Tab.
-   Typing only `@` shows up to three recently sent file/image mentions. Typing only `#` does the same for prompt tags. If fewer than three have send history, the remaining slots are filled with available unused entries; a library containing only one or two entries shows exactly those entries.
-4. Use **Name**, **Added**, or **Type** at the top of the mention menu to change its persistent sort order.
-   The same Name, Date added, and File type controls are available in the files-and-images library.
-5. Send normally. The script attaches each uniquely mentioned file, expands its private reference note for ChatGPT, and renders the sent reference back as a local `@nickname` chip.
-6. Hover a chip to see the exact reference note and linked file. Images can be enlarged; other files can be downloaded from their preview.
+1. Select the **file library** button beside ChatGPT's **Add files** button.
+2. Add a supported file and give it a nickname.
+3. Optionally add a private reference note that ChatGPT should receive.
+4. Type `@` followed by part of the nickname in the ChatGPT composer.
+5. Choose a match with the mouse, or use the arrow keys and press
+   <kbd>Enter</kbd> or <kbd>Tab</kbd>.
+6. Send normally.
 
-### Reusable prompt tags
+Prompt Forge attaches each uniquely mentioned file, expands its reference note for
+ChatGPT, and restores the sent reference as a compact local `@nickname` chip.
+Hover the chip to see its note and linked file. Image previews can be enlarged;
+other files can be downloaded.
 
-1. Open the mentions library and select **# Prompt tags** beside the existing **@ Files & images** tab.
-2. Give the snippet a tag name and save the reusable prompt text.
-   You can type `@` inside the snippet and select any saved file or image from autocomplete.
-3. Type `#` and part of its name in ChatGPT. Select the matching tag from the three-result autocomplete menu.
-4. Send normally. ChatGPT receives the complete saved prompt snippet, while your rendered message keeps the compact `#tag` chip.
-5. Hover the chip to inspect the full saved snippet.
+### File sorting
 
-Prompt tags can be sorted by Name, Date added, or Last used in both the prompt-tag library and filtered `#tag` autocomplete. A bare `#` continues to show the three most recently sent tags regardless of the selected sort mode.
+Use **Name**, **Added**, or **Type** to change the persistent sort order. These
+controls are available in both the autocomplete menu and the files-and-images
+library.
 
-When editing a saved file/image or prompt tag, select **Cancel edit** to clear the editing state and return to the create-new form without changing the saved entry.
+Typing only `@` shows up to three recently sent files. When fewer than three have
+send history, unused entries fill the remaining positions. A library containing
+only one or two entries shows only those entries.
 
-When a `#tag` contains one or more `@file` mentions, invoking that tag automatically attaches every referenced file once and expands each file's reference note for ChatGPT. You do not need to repeat those `@mentions` in the main composer.
+## 🏷️ Use prompt tags
 
-File references work in the other direction too: type `#` in a file's reference-note field to include a saved prompt tag. Dependencies are resolved recursively, so an `@file` can call a `#tag` that references other `@files`. Circular references are stopped safely, and every required file is attached only once.
+1. Open the library and select **# Prompt tags** beside **@ Files & images**.
+2. Give the snippet a tag name and enter the reusable prompt text.
+3. Type `#` followed by part of its name in the ChatGPT composer.
+4. Select a match and send normally.
 
-Long prompt-tag text is shortened with `...` in library and autocomplete previews only. The complete saved text is retained in storage, hover details, and the prompt sent to ChatGPT.
+ChatGPT receives the complete saved snippet while the rendered message retains a
+compact `#tag` chip. Hover the chip to inspect the full prompt.
 
-Recent-mention ranking changes only after ChatGPT accepts a sent prompt and clears the composer. Opening autocomplete, selecting an item, editing a saved entry, or abandoning a draft does not affect the ranking.
+Prompt tags can be sorted by **Name**, **Date added**, or **Last used** in the
+library and filtered autocomplete. Typing only `#` always shows up to three
+recently sent tags, regardless of the selected sort mode.
 
-Sent messages automatically restore expanded references to their local `@file` and `#tag` chips. New prompts do not include internal database IDs in their marker text, and legacy malformed tails such as `as a reference [ref:…]` are removed from the visible user message. Full notes and snippets remain available through hover previews or the library editor.
+> [!TIP]
+> Long prompt text is shortened with `...` in library and autocomplete previews
+> only. The complete text remains available in storage, hover details, and the
+> prompt sent to ChatGPT.
 
-Files, notes, and prompt tags are stored locally in IndexedDB for the `chatgpt.com` origin. Files are not uploaded until a prompt that mentions them is sent. Deleting browser site data removes the library.
+## 🔗 Combine files and tags
 
-## Notes
+References work in both directions:
 
-- Nicknames support letters, numbers, `_`, and `-`.
-- Supported categories include images, PDFs, Word-style documents, spreadsheets, presentations, common text/data formats, and source-code files. Common examples include PNG/JPEG, PDF, DOCX, XLS/XLSX, CSV/TSV, PPT/PPTX, TXT, Markdown, JSON, and source code. `.gdoc` files must first be exported to a supported format.
-- A repeated nickname in one prompt attaches its file once.
-- ChatGPT account upload limits still apply.
-- This script relies on the stable composer identifiers found in the supplied HTML: `#prompt-textarea`, `#upload-files`, and `#composer-submit-button`, with fallback selectors for minor site updates.
+- Type `@` inside a prompt tag to include saved files or images.
+- Type `#` inside a file's reference note to include a saved prompt tag.
+- Nest references recursively to build reusable prompt workflows.
+
+Prompt Forge resolves dependencies automatically, stops circular references
+safely, and attaches every required file only once. You do not need to repeat a
+tag's nested `@mentions` in the main composer.
+
+## 🧭 Editing and recent items
+
+When editing a saved file or prompt tag, select **Cancel edit** to return to the
+create-new form without changing the saved entry.
+
+Recent-item ranking changes only after ChatGPT accepts a prompt and clears the
+composer. Opening autocomplete, selecting an item, editing an entry, or abandoning
+a draft does not affect the ranking.
+
+## 🔒 Storage and privacy
+
+Files, notes, and prompt tags are stored locally in IndexedDB for the
+`chatgpt.com` origin.
+
+- Files are not uploaded until a prompt that references them is sent.
+- Clearing browser site data removes the local library.
+- Normal ChatGPT account upload limits still apply.
+
+> [!IMPORTANT]
+> Back up anything irreplaceable outside Prompt Forge. Browser storage can be
+> removed when site data is cleared.
+
+## 📄 Supported files
+
+| Category | Common examples |
+| --- | --- |
+| Images | PNG, JPEG, WebP, GIF |
+| Documents | PDF, DOC, DOCX, ODT, RTF |
+| Spreadsheets | XLS, XLSX, CSV, TSV, ODS |
+| Presentations | PPT, PPTX, ODP |
+| Text and data | TXT, Markdown, HTML, XML, JSON, YAML, TOML |
+| Source code | JavaScript, TypeScript, Python, Java, C/C++, C#, Go, Rust, and more |
+
+Google Docs `.gdoc` shortcut files must first be exported to a supported format.
+Nicknames may contain letters, numbers, underscores (`_`), and hyphens (`-`).
+
+## ⚙️ Compatibility
+
+Prompt Forge targets the following ChatGPT composer identifiers:
+
+```text
+#prompt-textarea
+#upload-files
+#composer-submit-button
+```
+
+Fallback selectors provide resilience against minor composer changes. Larger
+ChatGPT interface updates may require a script update.
+
+---
+
+<div align="center">
+
+**Forge once. Reuse everywhere.**
+
+</div>
