@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Forge
 // @namespace    local.chatgpt.image-mentions
-// @version      1.8.0
+// @version      1.8.2
 // @description  Reuse files with @mentions, prompt snippets with #tags, and optional random image pools in ChatGPT.
 // @author       You
 // @match        https://chatgpt.com/*
@@ -964,30 +964,37 @@
     const amount = context.query.length + 1;
     if (range.startContainer.nodeType === Node.TEXT_NODE && range.startOffset >= amount) {
       range.setStart(range.startContainer, range.startOffset - amount);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const replacement = `${trigger}${name} `;
+      const inserted = document.execCommand('insertText', false, replacement);
+      if (inserted) {
+        closeAutocomplete();
+        editor.focus();
+        requestAnimationFrame(() => hydrateStoredReferences(editor));
+        return;
+      }
     } else {
       document.execCommand('delete', false);
       document.execCommand('insertText', false, `${trigger}${name} `);
       closeAutocomplete();
-      editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: `${trigger}${name} ` }));
+      dispatchEditorInput(editor, `${trigger}${name} `);
+      requestAnimationFrame(() => hydrateStoredReferences(editor));
       return;
     }
     range.deleteContents();
-    const chip = document.createElement('span');
-    chip.className = isTag ? 'cim-tag-mention' : 'cim-mention';
-    chip.contentEditable = 'false';
-    if (isTag) chip.dataset.cimTagId = item.id;
-    else chip.dataset.cimId = item.id;
-    chip.textContent = `${trigger}${name}`;
+    const reference = document.createTextNode(`${trigger}${name}`);
     const space = document.createTextNode('\u00a0');
     range.insertNode(space);
-    range.insertNode(chip);
+    range.insertNode(reference);
     range.setStartAfter(space);
     range.collapse(true);
     selection.removeAllRanges();
     selection.addRange(range);
     closeAutocomplete();
-    editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: `${trigger}${name} ` }));
+    dispatchEditorInput(editor, `${trigger}${name} `);
     editor.focus();
+    requestAnimationFrame(() => hydrateStoredReferences(editor));
   }
 
   function hydrateStoredReferences(editor = getEditor()) {
@@ -1141,21 +1148,21 @@
   }
 
   async function markMentionsUsed(records, tags) {
-    let order = Number(localStorage.getItem('cim-usage-sequence')) || 0;
-    const usedAt = Date.now();
-    const writes = [];
-    for (const record of records) {
-      record.lastUsedOrder = ++order;
-      record.lastUsedAt = usedAt;
-      writes.push(dbRequest('readwrite', (store) => store.put(record)));
-    }
-    for (const tag of tags) {
-      tag.lastUsedOrder = ++order;
-      tag.lastUsedAt = usedAt;
-      writes.push(dbRequest('readwrite', (store) => store.put(tag), TAG_STORE_NAME));
-    }
-    localStorage.setItem('cim-usage-sequence', String(order));
     try {
+      let order = Number(localStorage.getItem('cim-usage-sequence')) || 0;
+      const usedAt = Date.now();
+      const writes = [];
+      for (const record of records) {
+        record.lastUsedOrder = ++order;
+        record.lastUsedAt = usedAt;
+        writes.push(dbRequest('readwrite', (store) => store.put(record)));
+      }
+      for (const tag of tags) {
+        tag.lastUsedOrder = ++order;
+        tag.lastUsedAt = usedAt;
+        writes.push(dbRequest('readwrite', (store) => store.put(tag), TAG_STORE_NAME));
+      }
+      localStorage.setItem('cim-usage-sequence', String(order));
       await Promise.all(writes);
     } catch (error) {
       console.error('[Prompt Forge] Could not persist mention usage ranking', error);
@@ -1167,10 +1174,11 @@
     while (Date.now() < deadline) {
       if (!editor.isConnected || !(editor.innerText || '').trim()) {
         await markMentionsUsed(records, tags);
-        return;
+        return true;
       }
       await new Promise((resolve) => setTimeout(resolve, 80));
     }
+    return false;
   }
 
   function hasStoredMentions(text) {
@@ -1248,20 +1256,68 @@
     return plainTagReference(tag, context, stack);
   }
 
-  function setEditorText(editor, text) {
-    editor.focus();
-    const selection = getSelection();
-    const range = document.createRange();
-    range.selectNodeContents(editor);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    const inserted = document.execCommand('insertText', false, text);
-    if (!inserted) {
-      const paragraph = document.createElement('p');
-      paragraph.textContent = text;
-      editor.replaceChildren(paragraph);
+  function normalizedEditorText(value) {
+    return String(value ?? '')
+      .replace(/\u00a0/g, ' ')
+      .replace(/[\u200b\u2060]/g, '')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function editorTextMatches(editor, expected) {
+    return normalizedEditorText(editor?.innerText || editor?.textContent || '') === normalizedEditorText(expected);
+  }
+
+  function dispatchEditorInput(editor, text) {
+    try {
       editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+    } catch (error) {
+      console.warn('[Prompt Forge] InputEvent construction failed; using a basic input event', error);
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
     }
+  }
+
+  function setEditorText(editor, text) {
+    const value = String(text ?? '');
+    try {
+      // A selection made entirely of contenteditable="false" chips may make
+      // execCommand report success without changing anything. Flatten first.
+      editor.querySelectorAll('.cim-mention, .cim-tag-mention').forEach((chip) => {
+        chip.replaceWith(document.createTextNode(chip.textContent || ''));
+      });
+      editor.normalize();
+      editor.focus();
+      const selection = getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const inserted = document.execCommand('insertText', false, value);
+      if (inserted && editorTextMatches(editor, value)) return true;
+    } catch (error) {
+      console.warn('[Prompt Forge] Native composer rewrite failed; using the DOM fallback', error);
+    }
+    try {
+      const paragraph = document.createElement('p');
+      paragraph.textContent = value;
+      editor.replaceChildren(paragraph);
+      dispatchEditorInput(editor, value);
+      return editorTextMatches(editor, value);
+    } catch (error) {
+      console.error('[Prompt Forge] Composer fallback rewrite failed', error);
+      return false;
+    }
+  }
+
+  async function waitForSendButton(form, timeout = 2500) {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      const send = form.querySelector('#composer-submit-button, [data-testid="send-button"]');
+      if (send && !send.disabled && send.getAttribute('aria-disabled') !== 'true') return send;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error('ChatGPT did not enable the send button after expanding the prompt.');
   }
 
   function countAttachmentTiles(form) {
@@ -1275,6 +1331,9 @@
     const transfer = new DataTransfer();
     for (const file of input.files || []) transfer.items.add(file);
     for (const record of records) {
+      if (!record?.blob || typeof record.blob.arrayBuffer !== 'function') {
+        throw new Error(`The saved file @${record?.nickname || 'unknown'} is unavailable. Re-add it to the library and try again.`);
+      }
       transfer.items.add(new File([record.blob], attachmentFileName(record), {
         type: record.mimeType || record.blob.type || 'application/octet-stream', lastModified: record.lastModified || Date.now(),
       }));
@@ -1296,29 +1355,43 @@
     const editor = getEditor();
     const form = editor?.closest('form');
     if (!editor || !form) return toast('ChatGPT composer was not found. Refresh the page and try again.');
-    const originalText = editor.innerText.replace(/\u00a0/g, ' ').trim();
-    const dependencies = resolvePromptDependencies(originalText);
-    const records = dependencies.records;
-    const tags = dependencies.tags;
-    if (!records.length && !tags.length) return;
+    const originalText = (editor.innerText || editor.textContent || '').replace(/\u00a0/g, ' ').trim();
+    let records = [];
+    let tags = [];
     state.sending = true;
     closeAutocomplete();
     document.querySelectorAll('.cim-library-button').forEach((button) => button.classList.add('cim-sending'));
     try {
+      const dependencies = resolvePromptDependencies(originalText);
+      records = dependencies.records;
+      tags = dependencies.tags;
+      if (!records.length && !tags.length) return;
       const expansion = expandedPrompt(originalText, records, tags, dependencies.randomSelections);
-      setEditorText(editor, expansion.text);
+      if (!normalizedEditorText(expansion.text)) throw new Error('The saved prompt expanded to empty text.');
+      if (!setEditorText(editor, expansion.text)) throw new Error('ChatGPT rejected the expanded prompt text.');
       if (records.length) await attachRecords(form, records);
-      const send = form.querySelector('#composer-submit-button, [data-testid="send-button"]');
-      if (!send || send.disabled) throw new Error('ChatGPT send button is not ready.');
-      state.pendingPlainRestoration = {
+      let send = await waitForSendButton(form);
+      if (!editorTextMatches(editor, expansion.text) && !setEditorText(editor, expansion.text)) {
+        throw new Error('ChatGPT reset the composer before the expanded prompt could be sent.');
+      }
+      send = await waitForSendButton(form);
+      const restoration = {
         expandedText: expansion.text,
         restorations: expansion.restorations,
         expiresAt: Date.now() + 10000,
       };
-      rememberHistoryRestoration(state.pendingPlainRestoration);
+      state.pendingPlainRestoration = restoration;
       state.internalSubmit = true;
       send.click();
-      void markMentionsUsedAfterSend(editor, records, tags);
+      void markMentionsUsedAfterSend(editor, records, tags)
+        .then((sent) => {
+          if (sent) rememberHistoryRestoration(restoration);
+          else {
+            if (state.pendingPlainRestoration === restoration) state.pendingPlainRestoration = null;
+            console.warn('[Prompt Forge] ChatGPT did not clear the composer after the send attempt.');
+          }
+        })
+        .catch((error) => console.error('[Prompt Forge] Could not finalize sent mention metadata', error));
       const parts = [];
       if (records.length) parts.push(`${records.length} file${records.length === 1 ? '' : 's'}`);
       if (tags.length) parts.push(`${tags.length} prompt tag${tags.length === 1 ? '' : 's'}`);
@@ -1327,8 +1400,10 @@
     } catch (error) {
       console.error('[Prompt Forge] Send failed', error);
       state.pendingPlainRestoration = null;
-      setEditorText(editor, originalText);
-      toast(error.message || 'Could not attach the mentioned file.');
+      const restored = setEditorText(editor, originalText);
+      toast(restored
+        ? (error.message || 'Could not send the expanded prompt.')
+        : 'Could not send or restore the composer. Copy your draft before refreshing.');
     } finally {
       setTimeout(() => { state.internalSubmit = false; state.sending = false; document.querySelectorAll('.cim-sending').forEach((node) => node.classList.remove('cim-sending')); }, 800);
     }
