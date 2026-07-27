@@ -1,137 +1,301 @@
-<div align="center">
+# Prompt Forge
 
-# 🔨 Prompt Forge
+Reusable files, prompt snippets, and workflow graphs for ChatGPT.
 
-### Reusable files, references, and prompt snippets for ChatGPT
-
-![Version](https://img.shields.io/badge/version-1.6.3-8b5cf6?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.5.0-6f57c7?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-ChatGPT-10a37f?style=flat-square)
-![Type](https://img.shields.io/badge/type-userscript-334155?style=flat-square)
+![Type](https://img.shields.io/badge/type-userscript-475569?style=flat-square)
 
-</div>
+Prompt Forge is a browser userscript that adds a local reference library to the
+ChatGPT composer. Save a file as `@nickname`, store reusable text as `#tag`, or
+run a visual workflow with `!name`.
 
-Prompt Forge is a browser userscript that adds a local library of reusable files
-and prompt snippets to the ChatGPT composer. Reference a file with `@nickname` or
-insert a saved prompt with `#tag`—Prompt Forge handles the rest when you send.
+The library stays in the browser. Files are uploaded only when a prompt refers
+to them.
 
-> [!NOTE]
-> Prompt Forge was built against the ChatGPT composer captured in `ChatGPT.htm`.
-> It uses stable composer identifiers with fallback selectors for minor site updates.
+## Contents
 
-## ✨ Features
+- [Features](#features)
+- [Installation](#installation)
+- [File mentions](#file-mentions)
+- [Prompt tags](#prompt-tags)
+- [Workflows](#workflows)
+- [Reference expansion](#reference-expansion)
+- [History and editing](#history-and-editing)
+- [Storage and privacy](#storage-and-privacy)
+- [Supported files](#supported-files)
+- [Compatibility](#compatibility)
 
-| Feature | What it does |
+## Features
+
+| Feature | Description |
 | --- | --- |
-| **File mentions** | Save supported files once and reuse them with `@nickname`. |
-| **Prompt tags** | Store reusable prompt snippets and invoke them with `#tag`. |
-| **Smart autocomplete** | Shows up to three matching or recently used entries above the composer. |
-| **Nested references** | Prompt tags can reference files, and file notes can reference prompt tags. |
-| **Local previews** | Hover sent chips to inspect notes, snippets, images, or downloadable files. |
-| **Private local storage** | Keeps your library in IndexedDB until a referenced file is sent. |
+| File mentions | Save files locally and attach them with `@nickname`. |
+| Prompt tags | Store reusable prompt text and insert it with `#tag`. |
+| Workflow graphs | Build connected prompt flows and run them with `!name`. |
+| Random image pools | Draw a fresh image sample from a tag's saved pool. |
+| Nested references | Use tags inside file notes and files inside tags. |
+| Autocomplete | Search saved entries or reopen recently used items. |
+| Local previews | Inspect notes, prompt text, images, and downloads from a chip. |
+| Completion-aware runs | Wait for one ChatGPT response before starting the next workflow step. |
+| Error retry | Edit and resubmit a workflow turn after a temporary image-generation error. |
+| Local storage | Keep files, tags, workflows, and scoped history metadata in the browser. |
 
-## 🚀 Install
+## Installation
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/),
-   [Violentmonkey](https://violentmonkey.github.io/), or another userscript manager.
+   [Violentmonkey](https://violentmonkey.github.io/), or another userscript
+   manager.
 2. Create a new userscript.
-3. Replace its contents with [`PromptForge.js`](./PromptForge.js) and save.
-4. Open or refresh [ChatGPT](https://chatgpt.com/).
+3. Replace its contents with [`PromptForge.js`](./PromptForge.js).
+4. Save the script and refresh [ChatGPT](https://chatgpt.com/).
 
-## 📎 Use file mentions
+Prompt Forge was developed against the composer captured in `ChatGPT.htm`.
+Fallback selectors cover minor interface changes, but larger ChatGPT updates may
+require a script update.
 
-1. Select the **file library** button beside ChatGPT's **Add files** button.
-2. Add a supported file and give it a nickname.
-3. Optionally add a private reference note that ChatGPT should receive.
-4. Type `@` followed by part of the nickname in the ChatGPT composer.
-5. Choose a match with the mouse, or use the arrow keys and press
-   <kbd>Enter</kbd> or <kbd>Tab</kbd>.
-6. Send normally.
+## File mentions
 
-Prompt Forge attaches each uniquely mentioned file, expands its reference note for
-ChatGPT, and restores the sent reference as a compact local `@nickname` chip.
-Hover the chip to see its note and linked file. Image previews can be enlarged;
-other files can be downloaded.
+Open Prompt Forge from the button beside ChatGPT's file controls. Add a supported
+file, assign a nickname, and optionally write a reference note.
 
-### File sorting
+Type `@` in the composer to search the library:
 
-Use **Name**, **Added**, or **Type** to change the persistent sort order. These
-controls are available in both the autocomplete menu and the files-and-images
-library.
+```text
+Use @Pleco as the character reference.
+```
 
-Typing only `@` shows up to three recently sent files. When fewer than three have
-send history, unused entries fill the remaining positions. A library containing
-only one or two entries shows only those entries.
+When sent, Prompt Forge:
 
-## 🏷️ Use prompt tags
+1. attaches the referenced file;
+2. gives the temporary upload the nickname-based filename, such as `Pleco.png`;
+3. expands the saved reference note;
+4. restores the reference as a compact local chip in the sent message.
 
-1. Open the library and select **# Prompt tags** beside **@ Files & images**.
-2. Give the snippet a tag name and enter the reusable prompt text.
-3. Type `#` followed by part of its name in the ChatGPT composer.
-4. Select a match and send normally.
+The original filename and file data remain unchanged in the library.
 
-ChatGPT receives the complete saved snippet while the rendered message retains a
-compact `#tag` chip. Hover the chip to inspect the full prompt.
+### Sorting and recent files
 
-Prompt tags can be sorted by **Name**, **Date added**, or **Last used** in the
-library and filtered autocomplete. Typing only `#` always shows up to three
-recently sent tags, regardless of the selected sort mode.
+The file library and autocomplete results can be sorted by name, date added, or
+file type. Typing only `@` shows up to three recently sent files, followed by
+unused entries when fewer than three have send history.
 
-> [!TIP]
-> Long prompt text is shortened with `...` in library and autocomplete previews
-> only. The complete text remains available in storage, hover details, and the
-> prompt sent to ChatGPT.
+Recent ranking changes only after ChatGPT accepts the prompt and clears the
+composer. Opening autocomplete or abandoning a draft does not change it.
 
-## 🔗 Combine files and tags
+## Prompt tags
 
-References work in both directions:
+Prompt tags store reusable text under a short name:
 
-- Type `@` inside a prompt tag to include saved files or images.
-- Type `#` inside a file's reference note to include a saved prompt tag.
-- Nest references recursively to build reusable prompt workflows.
+```text
+#polish-writing
+```
 
-Prompt Forge resolves dependencies automatically, stops circular references
-safely, and attaches every required file only once. You do not need to repeat a
-tag's nested `@mentions` in the main composer.
+ChatGPT receives the full saved text. Prompt Forge keeps a compact `#tag` chip in
+the rendered message and shows the complete text on hover.
 
-## 🧭 Editing and recent items
+Tags may be sorted by name, date added, or last used. Typing only `#` shows up to
+three recently sent tags.
 
-When editing a saved file or prompt tag, select **Cancel edit** to return to the
-create-new form without changing the saved entry.
+Complete `@nickname` and `#tag` references do not have to be selected from
+autocomplete. Prompt Forge recognizes matching references that were typed or
+pasted directly.
 
-Recent-item ranking changes only after ChatGPT accepts a prompt and clears the
-composer. Opening autocomplete, selecting an item, editing an entry, or abandoning
-a draft does not affect the ranking.
+### Random image pools
 
-## 🔒 Storage and privacy
+A prompt tag may select images from a saved pool each time it is used:
 
-Files, notes, and prompt tags are stored locally in IndexedDB for the
-`chatgpt.com` origin.
+1. create or edit a prompt tag;
+2. enable **Choose random images when this tag is used**;
+3. select the images in the pool;
+4. choose how many images to draw;
+5. save the tag.
 
-- Files are not uploaded until a prompt that references them is sent.
-- Clearing browser site data removes the local library.
-- Normal ChatGPT account upload limits still apply.
+One prompt uses one sample, including nested references to the same tag. An
+automatic workflow retry retains that original sample rather than drawing again.
 
-> [!IMPORTANT]
-> Back up anything irreplaceable outside Prompt Forge. Browser storage can be
-> removed when site data is cleared.
+## Workflows
 
-## 📄 Supported files
+Select **Workflow** in Prompt Forge, then create or edit a workflow. The designer
+uses a connected node graph:
 
-| Category | Common examples |
+1. add nodes from the left palette;
+2. drag an output pin to another node's input pin;
+3. use the True and False pins on an **If / Else** node to create branches;
+4. click a connection to remove it;
+5. save the workflow and run it with `!name`.
+
+A valid workflow has one starting node, and every node must be reachable from
+that start. Prompt Forge checks both conditions before saving.
+
+The floating run panel shows progress and provides a **Stop** control. Each
+workflow has a configurable response timeout.
+
+### Nodes
+
+| Node | Purpose |
+| --- | --- |
+| Prompt | Send text, wait for completion, and optionally repeat. |
+| Delay | Wait before continuing. |
+| Generated Image | Save the latest generated image under a reusable name. |
+| If / Else | Route by text, regex, emptiness, or image presence. |
+| Approval | Pause for Continue, Retry, Edit Output, or Stop. |
+| For Each | Send one prompt for every line or JSON-array item. |
+| Retry / Validate | Repeat the previous prompt until a rule passes. |
+| Extract Variable | Save text, a regex capture, or a JSON path. |
+| Run Workflow | Run another saved workflow as a bounded subgraph. |
+
+### Variables
+
+| Variable | Value |
+| --- | --- |
+| `{{input}}` | Text entered alongside the `!workflow` chip. |
+| `{{last}}` | Most recent assistant output. |
+| `{{lastImage}}` | Most recent generated image. Using it in a Prompt attaches the image. |
+| `{{image:name}}` | Image saved by a **Generated Image** node. |
+| `{{var:name}}` | Value saved by an **Extract Variable** node. |
+| `{{output:1}}` | First completed Prompt output. Change the number for later outputs. |
+| `{{item}}` | Current **For Each** item. |
+| `{{index}}` | Current **For Each** position. |
+| `{{itemTotal}}` | Total number of **For Each** items. |
+| `{{iteration}}` | Current Prompt repetition. |
+| `{{repeatTotal}}` | Total repetitions for the current Prompt node. |
+| `{{step}}` | Current Prompt-node number. |
+
+Saved file mentions and prompt tags work inside Prompt nodes. The workflow editor
+also provides shortcuts for `{{input}}`, `{{last}}`, and `{{lastImage}}`.
+
+### Retry on error
+
+Enable **Retry on error** in the Options panel to handle temporary
+image-generation failures.
+
+Prompt Forge first uses ChatGPT's **Edit message** action and resubmits the exact
+resolved prompt with its existing attachments. If the edit control is
+unavailable, it uses the main composer with the same text, references, random
+sample, and materialized files.
+
+Only one automatic retry is attempted. A second failure stops the workflow.
+Policy and safety refusals are not retried.
+
+### Limits
+
+| Limit | Value |
+| --- | ---: |
+| Prompt runs per workflow | 100 |
+| Repetitions per Prompt node | 50 |
+| For Each items | 50 |
+| Validation retries | 10 |
+| Nested workflow depth | 5 |
+| Delay | 1 hour |
+
+Recursive workflow calls are rejected.
+
+## Reference expansion
+
+Files and tags can refer to one another:
+
+- use `@nickname` inside a prompt tag;
+- use `#tag` inside a file's reference note;
+- nest references to build larger reusable prompts.
+
+Prompt Forge resolves the dependency graph, stops circular expansion, and
+attaches each required file once per send.
+
+Before a prompt is sent, references become ordinary text:
+
+```text
+@Pleco
+```
+
+becomes:
+
+```text
+Pleco.png
+```
+
+With a saved reference note:
+
+```text
+Pleco.png — use this image as the character reference
+```
+
+A prompt tag becomes its saved text. A random pool adds an `Images:` line with
+the selected filenames and notes.
+
+No restoration markers, internal IDs, or HTML-like wrappers are sent to ChatGPT.
+
+## History and editing
+
+Prompt Forge stores a limited restoration map so `@nickname` and `#tag` chips
+can reappear after a conversation is refreshed.
+
+Each cache entry is bound to the exact ChatGPT turn ID. Text-only legacy entries
+are removed during startup so a cached reference cannot rewrite an unrelated
+message.
+
+When a sent message enters edit mode, selecting a chip reveals the exact text
+that was originally sent. Leaving edit mode collapses unchanged expansions back
+into local chips.
+
+Restoration metadata affects presentation only. It does not alter the
+conversation stored by ChatGPT.
+
+## Attachment handling
+
+Prompt Forge gives ChatGPT only the files required for the current send. It does
+not replay files left in the hidden upload input.
+
+After ChatGPT accepts an attachment, Prompt Forge clears its synthetic native
+file selection. This keeps a previous script upload from leaking into the next
+file-picker action or causing a duplicate-image warning.
+
+Normal ChatGPT upload and account limits still apply.
+
+## Storage and privacy
+
+Files, notes, tags, and workflow graphs are stored in a dedicated IndexedDB
+database under the `chatgpt.com` origin.
+
+Small preferences and turn-scoped chip metadata use Prompt Forge-specific
+`localStorage` keys.
+
+- Files are not uploaded until a prompt references them.
+- History metadata is limited to 60 recent expanded prompts and a bounded total
+  size.
+- Clearing site data removes the local library and preferences.
+- Using another browser or profile creates a separate library.
+
+Keep a separate copy of anything irreplaceable. Browser storage may be removed
+when site data is cleared.
+
+## Supported files
+
+| Category | Common formats |
 | --- | --- |
 | Images | PNG, JPEG, WebP, GIF |
 | Documents | PDF, DOC, DOCX, ODT, RTF |
 | Spreadsheets | XLS, XLSX, CSV, TSV, ODS |
 | Presentations | PPT, PPTX, ODP |
 | Text and data | TXT, Markdown, HTML, XML, JSON, YAML, TOML |
-| Source code | JavaScript, TypeScript, Python, Java, C/C++, C#, Go, Rust, and more |
+| Source code | JavaScript, TypeScript, Python, Java, C/C++, C#, Go, Rust, and others |
 
-Google Docs `.gdoc` shortcut files must first be exported to a supported format.
-Nicknames may contain letters, numbers, underscores (`_`), and hyphens (`-`).
+Google Docs `.gdoc` shortcut files must be exported to a supported format first.
 
-## ⚙️ Compatibility
+Nicknames may contain letters, numbers, underscores, and hyphens.
 
-Prompt Forge targets the following ChatGPT composer identifiers:
+### File limits
+
+- General files: 512 MB
+- Images: 20 MB
+- Spreadsheets: approximately 50 MB
+
+These limits follow the checks used by Prompt Forge and may also be constrained
+by ChatGPT.
+
+## Compatibility
+
+Prompt Forge currently targets these composer identifiers:
 
 ```text
 #prompt-textarea
@@ -139,13 +303,8 @@ Prompt Forge targets the following ChatGPT composer identifiers:
 #composer-submit-button
 ```
 
-Fallback selectors provide resilience against minor composer changes. Larger
-ChatGPT interface updates may require a script update.
+It also checks fallback selectors for send controls, attachment controls,
+message turns, and generated images.
 
----
-
-<div align="center">
-
-**Forge once. Reuse everywhere.**
-
-</div>
+ChatGPT is a changing web application. If an interface update breaks a selector,
+review the browser console for messages prefixed with `[Prompt Forge]`.
