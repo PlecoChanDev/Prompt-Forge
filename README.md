@@ -1,8 +1,12 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/PlecoChanDev/OnlyImages/refs/heads/main/PromptForge.png" alt="Prompt Forge logo" width="360">
+</p>
+
 # Prompt Forge
 
 Reusable files, prompt snippets, and workflow graphs for ChatGPT.
 
-![Version](https://img.shields.io/badge/version-2.5.0-6f57c7?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.5.1-6f57c7?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-ChatGPT-10a37f?style=flat-square)
 ![Type](https://img.shields.io/badge/type-userscript-475569?style=flat-square)
 
@@ -170,10 +174,14 @@ also provides shortcuts for `{{input}}`, `{{last}}`, and `{{lastImage}}`.
 Enable **Retry on error** in the Options panel to handle temporary
 image-generation failures.
 
-Prompt Forge first uses ChatGPT's **Edit message** action and resubmits the exact
-resolved prompt with its existing attachments. If the edit control is
-unavailable, it uses the main composer with the same text, references, random
-sample, and materialized files.
+When ChatGPT displays its **Image generation failed** card, Prompt Forge first
+uses the card's native **Try again** action. This retries the image tool without
+creating another prompt or uploading the reference images again.
+
+If that action is unavailable, Prompt Forge uses **Edit message** and resubmits
+the exact resolved prompt with its existing attachments. The final fallback uses
+the main composer with the same text, references, random sample, and materialized
+files.
 
 Only one automatic retry is attempted. A second failure stops the workflow.
 Policy and safety refusals are not retried.
