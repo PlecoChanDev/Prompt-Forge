@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Prompt Forge
 // @namespace    local.chatgpt.image-mentions
-// @version      2.5.0
+// @version      2.6.1
 // @description  Reuse files, prompt snippets, and visual !workflow graphs in ChatGPT.
 // @author       You
 // @match        https://chatgpt.com/*
@@ -23,6 +23,7 @@
   const HISTORY_RESTORATIONS_MAX_CHARS = 600000;
   const RETRY_ON_ERROR_KEY = 'cim-retry-on-error';
   const AUTOMATIC_ERROR_RETRY_LIMIT = 1;
+  const STANDALONE_RETRY_TIMEOUT_MS = 15 * 60 * 1000;
   const MARKER_RE = /⟦(?:Image|File) reference @([A-Za-z0-9_-]+): ([^⟧]*?)(?: \[ref:([A-Za-z0-9-]+)\])?⟧/g;
   const TAG_MARKER_RE = /⟦Prompt tag #([A-Za-z0-9_-]+): ([^⟧]*?)(?: \[tag:([A-Za-z0-9-]+)\])?⟧/g;
   const MENTION_RE = /(^|\s)@([A-Za-z0-9_-]+)/g;
@@ -68,6 +69,7 @@
     tooltipTimer: null,
     autocompleteTimer: null,
     automationRun: null,
+    standaloneRetry: null,
     retryOnError: localStorage.getItem(RETRY_ON_ERROR_KEY) === 'true',
     workflowZoom: 1,
     workflowConnections: [],
@@ -568,7 +570,7 @@
     backdrop.innerHTML = `
       <section class="cim-modal" role="dialog" aria-modal="true" aria-labelledby="cim-title">
         <header class="cim-modal-header"><h2 id="cim-title">Prompt Forge library</h2><button type="button" class="cim-icon-button" data-cim-close aria-label="Close">${ICONS.close}</button></header>
-        <nav class="cim-tabs" aria-label="Mention types">
+        <nav class="cim-tabs" aria-label="Prompt Forge sections">
           <button type="button" data-cim-tab="files" role="tab" aria-selected="true">@ Files &amp; images</button>
           <button type="button" data-cim-tab="tags" role="tab" aria-selected="false"># Prompt tags</button>
           <button type="button" data-cim-tab="automate" role="tab" aria-selected="false">! Workflow</button>
@@ -663,12 +665,12 @@
         </div>
         <section class="cim-settings-panel cim-hidden" data-cim-panel="options">
           <h3>Options</h3>
-          <p>Configure how Prompt Forge behaves while running workflows.</p>
+          <p>Configure Prompt Forge across regular chats, saved references, and workflows.</p>
           <label class="cim-setting-toggle">
             <input id="cim-retry-on-error" type="checkbox">
             <span>
               <strong>Retry on error</strong>
-              <small>When ChatGPT reports a temporary image-generation error, resend the same workflow prompt once. Policy refusals are not retried.</small>
+              <small>For any ChatGPT send, use the native Try again action once after an image-generation failure. If it is unavailable, edit and resend the same prompt. Policy refusals are not retried.</small>
             </span>
           </label>
         </section>
@@ -701,6 +703,7 @@
     backdrop.querySelector('#cim-tag-random-pool').addEventListener('change', updateTagRandomPoolState);
     backdrop.querySelector('#cim-retry-on-error').addEventListener('change', (event) => {
       state.retryOnError = event.target.checked;
+      if (!state.retryOnError) state.standaloneRetry = null;
       localStorage.setItem(RETRY_ON_ERROR_KEY, String(state.retryOnError));
     });
     backdrop.addEventListener('mousedown', (event) => { if (event.target === backdrop) closeModal(); });
@@ -2249,11 +2252,22 @@
   async function waitForSendButton(form, timeout = 2500) {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
-      const send = form.querySelector('#composer-submit-button, [data-testid="send-button"]');
+      const send = composerSendButton(form);
       if (send && !send.disabled && send.getAttribute('aria-disabled') !== 'true') return send;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     throw new Error('ChatGPT did not enable the send button after expanding the prompt.');
+  }
+
+  function composerSendButton(form) {
+    if (!form) return null;
+    return [...form.querySelectorAll('button')].find((button) => {
+      const label = turnButtonLabel(button);
+      const knownSelector = button.matches('#composer-submit-button, [data-testid="send-button"], [data-testid="composer-submit-button"], .composer-submit-button-color');
+      const sendLabel = /\b(?:send|submit)(?:\s+(?:prompt|message))?\b/i.test(label);
+      const wrongControl = /\b(?:stop|voice|dictation|cancel)\b/i.test(label);
+      return (knownSelector || button.type === 'submit' || sendLabel) && !wrongControl;
+    }) || null;
   }
 
   function countAttachmentTiles(form) {
@@ -2290,7 +2304,7 @@
     const deadline = Date.now() + 20000;
     try {
       while (Date.now() < deadline) {
-        const send = form.querySelector('#composer-submit-button, [data-testid="send-button"]');
+        const send = composerSendButton(form);
         if (countAttachmentTiles(form) >= expected && send && !send.disabled) return;
         await new Promise((resolve) => setTimeout(resolve, 160));
       }
@@ -2367,6 +2381,7 @@
 
   function isTemporaryImageGenerationError(result) {
     if (!result || result.image) return false;
+    if (imageGenerationFailure(result.turn)) return true;
     const text = String(result.text || '').replace(/\s+/g, ' ').trim();
     if (!text) return false;
     if (/\b(?:content\s+policy|polic(?:y|ies)|safety|guidelines?|not able to help with|can(?:not|['’]?t) help with)\b/i.test(text)) return false;
@@ -2379,6 +2394,7 @@
   async function waitForAutomationGeneration(beforeTurns, timeoutMs, run) {
     const before = new Set(beforeTurns);
     const beforeSignatures = new Map(beforeTurns.map((turn) => [turn, automationTurnSignature(turn)]));
+    const changedTurns = new Set();
     const deadline = Date.now() + timeoutMs;
     let candidate = null;
     let signature = '';
@@ -2388,10 +2404,12 @@
       if (run.cancelled) throw new Error('Workflow stopped. The current ChatGPT generation may continue.');
       const turns = assistantTurns();
       const last = turns.at(-1);
+      const lastSignature = automationTurnSignature(last);
+      if (last && before.has(last) && lastSignature !== beforeSignatures.get(last)) changedTurns.add(last);
       const isNew = last && (
         !before.has(last)
         || turns.length > beforeTurns.length
-        || automationTurnSignature(last) !== beforeSignatures.get(last)
+        || changedTurns.has(last)
       );
       if (isNew) {
         if (candidate !== last) {
@@ -2410,6 +2428,7 @@
             text: automationOutputText(candidate),
             image: automationGeneratedImage(candidate),
             turnId: candidate.dataset.turnId || '',
+            turn: candidate,
           };
         }
       }
@@ -2586,6 +2605,32 @@
     return `${button?.getAttribute('aria-label') || ''} ${button?.dataset.testid || ''} ${button?.textContent || ''}`.replace(/\s+/g, ' ').trim();
   }
 
+  function imageGenerationFailure(turn = assistantTurns().at(-1)) {
+    if (!turn) return null;
+    const outerTurn = turn.matches?.('[data-turn="assistant"]')
+      ? turn
+      : turn.closest?.('[data-turn="assistant"]') || turn;
+    const failureTitle = [...outerTurn.querySelectorAll('span, p, div')].find((node) =>
+      /^image generation failed$/i.test((node.textContent || '').replace(/\s+/g, ' ').trim()));
+    if (!failureTitle) return null;
+    const retryButton = [...outerTurn.querySelectorAll('button.btn-secondary.btn-small, button')].find((button) =>
+      !button.disabled
+      && button.getAttribute('aria-disabled') !== 'true'
+      && /^try again$/i.test((button.textContent || '').replace(/\s+/g, ' ').trim()));
+    return { turn: outerTurn, title: failureTitle, retryButton: retryButton || null };
+  }
+
+  async function retryNativeImageGeneration(timeoutMs, run = null) {
+    if (run?.sentCount >= 100) throw new Error('Workflow stopped at the 100-prompt runtime safety limit.');
+    const failure = imageGenerationFailure();
+    const retry = failure?.retryButton;
+    if (!failure || !retry) return null;
+    const beforeTurns = assistantTurns();
+    retry.click();
+    if (run) run.sentCount += 1;
+    return waitForAutomationGeneration(beforeTurns, timeoutMs, run || { cancelled: false });
+  }
+
   function setTurnEditorText(editor, text) {
     if (!editor) return false;
     if (editor.matches('textarea, input')) {
@@ -2599,8 +2644,8 @@
     return setEditorText(editor, text);
   }
 
-  async function retryAutomationPromptByEditing(automation, run, sendPackage) {
-    if (run.sentCount >= 100) throw new Error('Workflow stopped at the 100-prompt runtime safety limit.');
+  async function retryPromptByEditing(promptText, timeoutMs, run = null) {
+    if (run?.sentCount >= 100) throw new Error('Workflow stopped at the 100-prompt runtime safety limit.');
     const turn = userTurns().at(-1);
     const edit = turn?.querySelector('button[aria-label="Edit message" i], button[data-testid*="edit" i]');
     if (!turn || !edit) return null;
@@ -2619,7 +2664,7 @@
       if (submit && editor) break;
       await new Promise((resolve) => setTimeout(resolve, 80));
     }
-    if (!submit || !editor || !setTurnEditorText(editor, sendPackage.expansion.text)) {
+    if (!submit || !editor || !setTurnEditorText(editor, promptText)) {
       const cancel = [...turn.querySelectorAll('button')].find((button) => /\bcancel\b/i.test(turnButtonLabel(button)));
       cancel?.click();
       return null;
@@ -2627,12 +2672,12 @@
     state.internalSubmit = true;
     try {
       submit.click();
-      run.sentCount += 1;
+      if (run) run.sentCount += 1;
       await new Promise((resolve) => setTimeout(resolve, 120));
     } finally {
       state.internalSubmit = false;
     }
-    return waitForAutomationGeneration(beforeTurns, (automation.timeoutMinutes || 15) * 60000, run);
+    return waitForAutomationGeneration(beforeTurns, timeoutMs, run || { cancelled: false });
   }
 
   async function sendAutomationPromptWithErrorRetry(promptText, automation, run, imageReferences = [], preparedPackage = null) {
@@ -2649,11 +2694,47 @@
         run.completed,
         run.total,
       );
-      result = await retryAutomationPromptByEditing(automation, run, sendPackage);
+      const timeoutMs = (automation.timeoutMinutes || 15) * 60000;
+      result = await retryNativeImageGeneration(timeoutMs, run);
+      if (!result) result = await retryPromptByEditing(sendPackage.expansion.text, timeoutMs, run);
       if (!result) result = await sendPreparedAutomationPrompt(sendPackage, automation, run);
       if (!isTemporaryImageGenerationError(result)) return { result, sendPackage };
     }
     throw new Error('ChatGPT reported another image-generation error after Prompt Forge retried the same prompt.');
+  }
+
+  function scheduleStandaloneRetryMonitor(beforeTurns, promptText) {
+    if (!state.retryOnError) return;
+    const active = state.standaloneRetry;
+    if (active && active.promptText === promptText && Date.now() - active.startedAt < 1000) return;
+    const monitor = { beforeTurns, promptText, startedAt: Date.now() };
+    state.standaloneRetry = monitor;
+    void monitorStandaloneImageGeneration(monitor);
+  }
+
+  async function monitorStandaloneImageGeneration(monitor) {
+    try {
+      const result = await waitForAutomationGeneration(
+        monitor.beforeTurns,
+        STANDALONE_RETRY_TIMEOUT_MS,
+        { cancelled: false },
+      );
+      if (state.standaloneRetry !== monitor || !state.retryOnError || !isTemporaryImageGenerationError(result)) return;
+      toast('Image generation failed. Retrying once…');
+      let retryResult = await retryNativeImageGeneration(STANDALONE_RETRY_TIMEOUT_MS);
+      if (!retryResult) retryResult = await retryPromptByEditing(monitor.promptText, STANDALONE_RETRY_TIMEOUT_MS);
+      if (!retryResult) {
+        toast('Image generation failed, and ChatGPT did not expose a retry control.');
+        return;
+      }
+      if (isTemporaryImageGenerationError(retryResult)) {
+        toast('Image generation failed again after one retry.');
+      }
+    } catch (error) {
+      console.warn('[Prompt Forge] Regular-send retry monitor ended without a completed response', error);
+    } finally {
+      if (state.standaloneRetry === monitor) state.standaloneRetry = null;
+    }
   }
 
   function automationContext(run, input, extra = {}) {
@@ -2946,6 +3027,7 @@
         throw new Error('ChatGPT reset the composer before the expanded prompt could be sent.');
       }
       send = await waitForSendButton(form);
+      const beforeAssistantTurns = assistantTurns();
       const beforeUserTurnIds = new Set(userTurns().map(conversationTurnId).filter(Boolean));
       const restoration = {
         expandedText: expansion.text,
@@ -2956,6 +3038,7 @@
       state.pendingPlainRestoration = restoration;
       state.internalSubmit = true;
       send.click();
+      scheduleStandaloneRetryMonitor(beforeAssistantTurns, expansion.text);
       void markMentionsUsedAfterSend(editor, records, tags)
         .then((sent) => {
           if (sent) {
@@ -2990,8 +3073,10 @@
   }
 
   function interceptClick(event) {
-    const send = event.target.closest?.('#composer-submit-button, [data-testid="send-button"]');
-    if (!send || state.internalSubmit) return;
+    const clickedButton = event.target.closest?.('button');
+    const form = clickedButton?.closest('form');
+    const send = composerSendButton(form);
+    if (!send || clickedButton !== send || state.internalSubmit) return;
     if (state.automationRun) {
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -2999,7 +3084,11 @@
       return;
     }
     const editor = getEditor();
-    if (!hasComposerActions(editor?.innerText || '')) return;
+    const text = editor?.innerText || '';
+    if (!hasComposerActions(text)) {
+      if (state.retryOnError && !send.disabled) scheduleStandaloneRetryMonitor(assistantTurns(), text);
+      return;
+    }
     event.preventDefault();
     event.stopImmediatePropagation();
     submitComposerActions();
@@ -3014,7 +3103,12 @@
       return;
     }
     const editor = event.target.querySelector('#prompt-textarea[contenteditable="true"], div.ProseMirror[contenteditable="true"]');
-    if (!editor || !hasComposerActions(editor.innerText || '')) return;
+    if (!editor) return;
+    const text = editor.innerText || '';
+    if (!hasComposerActions(text)) {
+      if (state.retryOnError) scheduleStandaloneRetryMonitor(assistantTurns(), text);
+      return;
+    }
     event.preventDefault();
     event.stopImmediatePropagation();
     submitComposerActions();
