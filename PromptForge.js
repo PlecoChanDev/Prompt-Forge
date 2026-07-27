@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Prompt Forge
 // @namespace    local.chatgpt.image-mentions
-// @version      1.8.2
-// @description  Reuse files with @mentions, prompt snippets with #tags, and optional random image pools in ChatGPT.
+// @version      2.5.0
+// @description  Reuse files, prompt snippets, and visual !workflow graphs in ChatGPT.
 // @author       You
 // @match        https://chatgpt.com/*
 // @match        https://www.chatgpt.com/*
@@ -14,18 +14,22 @@
   'use strict';
 
   const DB_NAME = 'chatgpt-image-mentions';
-  const DB_VERSION = 2;
+  const DB_VERSION = 3;
   const STORE_NAME = 'images';
   const TAG_STORE_NAME = 'promptTags';
+  const AUTOMATION_STORE_NAME = 'automations';
   const HISTORY_RESTORATIONS_KEY = 'cim-history-restorations';
-  const HISTORY_RESTORATIONS_LIMIT = 40;
+  const HISTORY_RESTORATIONS_LIMIT = 60;
   const HISTORY_RESTORATIONS_MAX_CHARS = 600000;
+  const RETRY_ON_ERROR_KEY = 'cim-retry-on-error';
+  const AUTOMATIC_ERROR_RETRY_LIMIT = 1;
   const MARKER_RE = /⟦(?:Image|File) reference @([A-Za-z0-9_-]+): ([^⟧]*?)(?: \[ref:([A-Za-z0-9-]+)\])?⟧/g;
   const TAG_MARKER_RE = /⟦Prompt tag #([A-Za-z0-9_-]+): ([^⟧]*?)(?: \[tag:([A-Za-z0-9-]+)\])?⟧/g;
   const MENTION_RE = /(^|\s)@([A-Za-z0-9_-]+)/g;
   const TAG_RE = /(^|\s)#([A-Za-z0-9_-]+)/g;
+  const AUTOMATION_RE = /(^|\s)!([A-Za-z0-9_-]+)/g;
   const REFERENCE_RE = /(^|\s)([@#])([A-Za-z0-9_-]+)/g;
-  const CHIPPABLE_REFERENCE_RE = /(^|\s)([@#])([A-Za-z0-9_-]+)(?=$|[\s.,!?;:()[\]{}'"“”])/g;
+  const CHIPPABLE_REFERENCE_RE = /(^|\s)([@#!])([A-Za-z0-9_-]+)(?=$|[\s.,!?;:()[\]{}'"“”])/g;
   const SUPPORTED_EXTENSIONS = new Set([
     'png', 'jpg', 'jpeg', 'webp', 'gif',
     'pdf', 'doc', 'docx', 'odt', 'rtf',
@@ -44,6 +48,9 @@
     tags: [],
     tagById: new Map(),
     tagByName: new Map(),
+    automations: [],
+    automationById: new Map(),
+    automationByName: new Map(),
     objectUrls: new Map(),
     autocomplete: { open: false, items: [], selected: 0, query: '' },
     sortMode: ['name', 'date', 'type'].includes(localStorage.getItem('cim-file-sort')) ? localStorage.getItem('cim-file-sort') : 'name',
@@ -51,6 +58,7 @@
     pendingFile: null,
     editingId: null,
     editingTagId: null,
+    editingAutomationId: null,
     modalTab: 'files',
     sending: false,
     internalSubmit: false,
@@ -59,6 +67,12 @@
     editingPlainRestorations: new WeakMap(),
     tooltipTimer: null,
     autocompleteTimer: null,
+    automationRun: null,
+    retryOnError: localStorage.getItem(RETRY_ON_ERROR_KEY) === 'true',
+    workflowZoom: 1,
+    workflowConnections: [],
+    workflowConnectionFrame: null,
+    workflowResizeObserver: null,
   };
 
   const ICONS = {
@@ -101,8 +115,8 @@
       .cim-selected-file small { color:var(--cim-muted); }
       .cim-field { display:block; margin-top:14px; }
       .cim-field span { display:block; margin:0 0 6px; font-size:12px; font-weight:650; }
-      .cim-field input, .cim-field textarea { width:100%; box-sizing:border-box; padding:10px 11px; border:1px solid var(--cim-border); border-radius:10px; outline:none; color:var(--cim-text); background:transparent; font:14px/1.4 system-ui; resize:vertical; }
-      .cim-field input:focus, .cim-field textarea:focus { border-color:var(--cim-accent); box-shadow:0 0 0 3px var(--cim-accent-soft); }
+      .cim-field input, .cim-field textarea, .cim-field select { width:100%; box-sizing:border-box; padding:10px 11px; border:1px solid var(--cim-border); border-radius:10px; outline:none; color:var(--cim-text); background:var(--cim-panel); font:14px/1.4 system-ui; resize:vertical; }
+      .cim-field input:focus, .cim-field textarea:focus, .cim-field select:focus { border-color:var(--cim-accent); box-shadow:0 0 0 3px var(--cim-accent-soft); }
       .cim-help { margin:6px 0 0; color:var(--cim-muted); font-size:11px; line-height:1.4; }
       .cim-primary { width:100%; margin-top:15px; padding:10px 14px; border:0; border-radius:10px; color:white; background:var(--cim-accent); font-weight:650; cursor:pointer; }
       .cim-primary:disabled { opacity:.45; cursor:not-allowed; }
@@ -187,7 +201,136 @@
       .cim-pool-option img { width:34px; height:34px; object-fit:cover; border-radius:6px; }
       .cim-pool-option span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10px; font-weight:650; }
       .cim-pool-empty { padding:12px 6px; color:var(--cim-muted); text-align:center; font-size:10px; }
-      @media (max-width:680px) { .cim-modal-body { grid-template-columns:1fr; } .cim-editor { border-right:0; border-bottom:1px solid var(--cim-border); } .cim-modal { max-height:94vh; } }
+      .cim-modal:has([data-cim-panel="automate"]:not(.cim-hidden)) { width:min(760px,96vw); }
+      .cim-modal-backdrop.cim-workflow-designing-backdrop { padding:8px; }
+      .cim-modal.cim-workflow-designing, .cim-modal.cim-workflow-designing:has([data-cim-panel="automate"]:not(.cim-hidden)) { width:calc(100vw - 16px); height:calc(100vh - 16px); max-height:none; border-radius:8px; }
+      .cim-automation-layout { grid-template-columns:minmax(390px,1.25fr) minmax(270px,.75fr); }
+      .cim-automation-editor { overflow:auto; }
+      .cim-automation-intro { margin:0 0 12px; color:var(--cim-muted); font-size:11px; line-height:1.45; }
+      .cim-skill-palette { display:flex; flex-wrap:wrap; gap:6px; margin:12px 0 9px; }
+      .cim-skill-palette button { padding:7px 9px; border:1px solid var(--cim-border); border-radius:8px; color:var(--cim-text); background:transparent; font:650 11px/1 system-ui; cursor:pointer; }
+      .cim-skill-palette button:hover { border-color:#db7c26; background:rgba(219,124,38,.1); }
+      .cim-node-graph { position:relative; display:flex; flex-direction:column; gap:16px; margin-top:8px; }
+      .cim-node { position:relative; padding:11px; border:1px solid var(--cim-border); border-radius:12px; background:rgba(127,127,127,.045); }
+      .cim-node:not(:last-child)::after { content:''; position:absolute; left:21px; top:100%; width:2px; height:17px; background:#db7c26; opacity:.65; }
+      .cim-node::before { content:''; position:absolute; left:17px; top:-5px; width:8px; height:8px; border:2px solid #db7c26; border-radius:50%; background:var(--cim-panel); }
+      .cim-node:first-child::before { display:none; }
+      .cim-node.cim-node-dragging { opacity:.4; }
+      .cim-node-header { display:flex; align-items:center; gap:7px; margin-bottom:8px; }
+      .cim-node-order { color:#db7c26; font:750 10px/1 ui-monospace,SFMono-Regular,Consolas,monospace; }
+      .cim-node-type { margin-right:auto; color:var(--cim-text); font:750 11px/1 ui-monospace,SFMono-Regular,Consolas,monospace; text-transform:uppercase; }
+      .cim-node-header button { width:25px; height:25px; display:grid; place-items:center; border:0; border-radius:6px; color:var(--cim-muted); background:transparent; cursor:pointer; }
+      .cim-node-header button:hover { color:var(--cim-text); background:rgba(127,127,127,.13); }
+      .cim-node textarea { min-height:92px; font:12px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace !important; }
+      .cim-node-options { display:flex; align-items:center; gap:8px; margin-top:8px; color:var(--cim-muted); font-size:10px; }
+      .cim-node-options input { width:58px; padding:5px 6px; border:1px solid var(--cim-border); border-radius:7px; color:var(--cim-text); background:var(--cim-panel); }
+      .cim-node-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+      .cim-node-fields .cim-field { margin-top:8px; }
+      .cim-node-fields .cim-field.cim-field-wide { grid-column:1/-1; }
+      .cim-approval-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
+      .cim-approval-actions button { flex:1; min-width:68px; }
+      .cim-workflow-host { min-height:0; flex:1; overflow:auto; }
+      .cim-workflow-home { min-height:360px; padding:20px; }
+      .cim-workflow-home-header { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:22px; padding:16px; border:1px solid var(--cim-border); border-radius:14px; background:linear-gradient(135deg,rgba(219,124,38,.12),rgba(118,87,214,.08)); }
+      .cim-workflow-home-header h3 { margin:0; font-size:18px; }
+      .cim-workflow-home-header p { margin:5px 0 0; color:var(--cim-muted); font-size:12px; }
+      .cim-workflow-home-header .cim-primary { width:auto; margin:0; white-space:nowrap; }
+      .cim-workflow-home > .cim-grid { grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); }
+      .cim-settings-panel { min-height:360px; padding:20px; overflow:auto; }
+      .cim-settings-panel h3 { margin:0; font-size:18px; }
+      .cim-settings-panel > p { margin:5px 0 18px; color:var(--cim-muted); font-size:12px; line-height:1.45; }
+      .cim-setting-toggle { max-width:560px; display:flex; align-items:flex-start; gap:11px; padding:14px; border:1px solid var(--cim-border); border-radius:13px; cursor:pointer; }
+      .cim-setting-toggle:has(input:checked) { border-color:rgba(219,124,38,.52); background:rgba(219,124,38,.08); }
+      .cim-setting-toggle input { margin-top:3px; accent-color:#db7c26; }
+      .cim-setting-toggle span { min-width:0; }
+      .cim-setting-toggle strong, .cim-setting-toggle small { display:block; }
+      .cim-setting-toggle strong { font-size:13px; }
+      .cim-setting-toggle small { margin-top:4px; color:var(--cim-muted); font-size:11px; line-height:1.45; }
+      .cim-workflow-panel { min-height:0; height:100%; flex:1; display:flex; flex-direction:column; overflow:hidden; background:#1d1f21; }
+      .cim-workflow-toolbar { display:grid; grid-template-columns:auto minmax(150px,.7fr) minmax(240px,1.4fr) 110px auto; align-items:end; gap:9px; padding:10px 12px; border-bottom:1px solid #050505; background:linear-gradient(#4b4d4f,#3a3c3e); box-shadow:inset 0 1px rgba(255,255,255,.08); }
+      .cim-workflow-toolbar > .cim-secondary { align-self:end; padding:8px 10px; border-color:#222; color:#eee; background:#343638; }
+      .cim-workflow-toolbar .cim-field { margin:0; }
+      .cim-workflow-toolbar .cim-field span { color:#ddd; }
+      .cim-workflow-toolbar .cim-field input { padding:7px 9px; border-color:#171717; color:#f4f4f4; background:#26282a; box-shadow:inset 0 1px 2px #0008; }
+      .cim-workflow-toolbar-actions { display:flex; gap:6px; }
+      .cim-workflow-toolbar-actions .cim-primary, .cim-workflow-toolbar-actions .cim-secondary { width:auto; margin:0; padding:8px 12px; }
+      .cim-workflow-workspace { min-height:0; flex:1; display:grid; grid-template-columns:230px minmax(0,1fr); }
+      .cim-workflow-sidebar { min-height:0; display:flex; flex-direction:column; border-right:1px solid #090909; color:#ddd; background:#2b2d2f; box-shadow:inset -1px 0 rgba(255,255,255,.04); }
+      .cim-workflow-sidebar h3 { margin:0; padding:9px 10px 7px; border-top:1px solid #111; border-bottom:1px solid #171717; background:#36383a; font-size:11px; letter-spacing:.04em; text-transform:uppercase; }
+      .cim-workflow-sidebar-head { display:flex; align-items:center; justify-content:space-between; }
+      .cim-workflow-sidebar-head span { color:#aaa; font-size:9px; }
+      .cim-workflow-sidebar .cim-skill-palette { display:grid; grid-template-columns:1fr; gap:3px; margin:0; padding:7px; overflow:auto; }
+      .cim-workflow-sidebar .cim-skill-palette button { display:flex; align-items:center; padding:7px 9px; border-color:#171717; border-radius:4px; color:#e4e4e4; background:linear-gradient(#454749,#353739); box-shadow:inset 0 1px rgba(255,255,255,.06); text-align:left; }
+      .cim-workflow-sidebar .cim-skill-palette button:hover { border-color:#df8a36; background:#4b4138; }
+      .cim-variable-tools { display:grid; grid-template-columns:1fr; gap:3px; padding:7px; border-top:1px solid #151515; }
+      .cim-variable-tools button { padding:6px 8px; border:1px solid #181818; border-radius:4px; color:#cdd6e0; background:#31363b; font:600 10px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace; cursor:pointer; text-align:left; }
+      .cim-workflow-library { min-height:110px; flex:1; padding:6px; overflow:auto; border-top:1px solid #151515; }
+      .cim-workflow-library .cim-grid { display:flex; flex-direction:column; gap:4px; }
+      .cim-workflow-library .cim-card { min-height:0; padding:7px 8px; border-color:#181818; border-radius:4px; background:#333537; }
+      .cim-workflow-library .cim-card-name { margin:0; color:#f0a45c; font-size:11px; }
+      .cim-workflow-library .cim-card-note { height:auto; max-height:28px; line-height:14px; }
+      .cim-workflow-library .cim-automation-badge { display:none; }
+      .cim-workflow-library .cim-card-actions { top:4px; right:4px; }
+      .cim-graph-shell { min-width:0; min-height:0; display:flex; flex-direction:column; background:#181a1c; }
+      .cim-graph-toolbar { height:38px; flex:none; display:flex; align-items:center; gap:6px; padding:0 9px; border-bottom:1px solid #070707; color:#ddd; background:linear-gradient(#383a3c,#2d2f31); }
+      .cim-graph-toolbar strong { margin-right:auto; font-size:12px; font-weight:650; }
+      .cim-graph-toolbar small { color:#999; font-size:9px; }
+      .cim-graph-toolbar button { min-width:28px; height:26px; padding:0 7px; border:1px solid #171717; border-radius:4px; color:#ddd; background:#414345; font:650 11px/1 system-ui; cursor:pointer; }
+      .cim-graph-toolbar button:hover { background:#505255; }
+      .cim-graph-viewport { min-height:0; flex:1; position:relative; overflow:auto; cursor:grab; background-color:#17191b; background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(rgba(255,255,255,.075) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.075) 1px,transparent 1px); background-size:16px 16px,16px 16px,80px 80px,80px 80px; }
+      .cim-graph-viewport.cim-panning { cursor:grabbing; user-select:none; }
+      .cim-graph-canvas { position:relative; width:1800px; height:1100px; transform-origin:0 0; }
+      .cim-graph-connections { position:absolute; inset:0; z-index:0; width:100%; height:100%; overflow:visible; pointer-events:none; }
+      .cim-graph-connections path { fill:none; stroke:#d8d8d8; stroke-width:2; filter:drop-shadow(0 1px 1px #000); }
+      .cim-graph-connections path[data-key] { pointer-events:stroke; cursor:pointer; }
+      .cim-graph-connections path[data-key]:hover { stroke-width:5; filter:drop-shadow(0 0 3px currentColor); }
+      .cim-graph-canvas .cim-node-graph { position:absolute; inset:0; z-index:1; display:block; margin:0; }
+      .cim-graph-canvas .cim-node { position:absolute; width:300px; min-width:0; padding:0 9px 10px; border:1px solid #060606; border-radius:5px; color:#ddd; background:#242729; box-shadow:0 3px 9px #000b,inset 0 0 0 1px rgba(255,255,255,.04); }
+      .cim-graph-canvas .cim-node.cim-node-dragging { z-index:10; opacity:.9; will-change:transform; }
+      .cim-graph-canvas .cim-node::before, .cim-graph-canvas .cim-node::after { display:none; }
+      .cim-graph-canvas .cim-node-header { height:31px; margin:0 -9px 7px; padding:0 9px; border-radius:4px 4px 0 0; background:linear-gradient(90deg,#2e6d91,#23485e); cursor:move; user-select:none; }
+      .cim-graph-canvas .cim-node[data-node-type="condition"] .cim-node-header { background:linear-gradient(90deg,#8b3030,#562020); }
+      .cim-graph-canvas .cim-node[data-node-type="approval"] .cim-node-header { background:linear-gradient(90deg,#7b5b20,#4d3918); }
+      .cim-graph-canvas .cim-node[data-node-type="image"] .cim-node-header { background:linear-gradient(90deg,#396f38,#254c26); }
+      .cim-graph-canvas .cim-node[data-node-type="extract"] .cim-node-header, .cim-graph-canvas .cim-node[data-node-type="foreach"] .cim-node-header { background:linear-gradient(90deg,#674487,#422c58); }
+      .cim-graph-canvas .cim-node[data-node-type="validate"] .cim-node-header { background:linear-gradient(90deg,#9a5b24,#603817); }
+      .cim-graph-canvas .cim-node[data-node-type="subflow"] .cim-node-header { background:linear-gradient(90deg,#286d65,#194842); }
+      .cim-graph-canvas .cim-node[data-node-type="delay"] .cim-node-header { background:linear-gradient(90deg,#555b62,#353a3f); }
+      .cim-graph-canvas .cim-node-order { color:#fff; }
+      .cim-graph-canvas .cim-node-type { color:#fff; font-size:10px; text-shadow:0 1px #000; }
+      .cim-graph-canvas .cim-node-header button { color:#ddd; }
+      .cim-graph-canvas .cim-field span { color:#bbb; }
+      .cim-graph-canvas .cim-field input, .cim-graph-canvas .cim-field textarea, .cim-graph-canvas .cim-field select { padding:7px 8px; border-color:#111; border-radius:4px; color:#eee; background:#191b1d; font-size:11px; box-shadow:inset 0 1px 2px #0009; }
+      .cim-graph-canvas .cim-node textarea { min-height:68px; }
+      .cim-graph-canvas .cim-help, .cim-graph-canvas .cim-node-options { color:#999; }
+      .cim-node-pin { position:absolute; top:11px; width:11px; height:11px; border:2px solid #eee; border-radius:50%; background:#292b2d; box-shadow:0 0 0 1px #050505; }
+      .cim-node-pin-input { left:-7px; }
+      .cim-node-pin-output { right:-7px; background:#eee; cursor:crosshair; }
+      .cim-branch-port { position:absolute; right:-7px; z-index:3; display:flex; align-items:center; gap:5px; color:#ddd; font:700 9px/1 system-ui; text-shadow:0 1px #000; }
+      .cim-branch-port-true { top:43px; color:#82df78; }
+      .cim-branch-port-false { top:68px; color:#ef7777; }
+      .cim-branch-port .cim-node-pin { position:static; display:block; cursor:crosshair; }
+      .cim-branch-port-true .cim-node-pin { border-color:#82df78; background:#82df78; }
+      .cim-branch-port-false .cim-node-pin { border-color:#ef7777; background:#ef7777; }
+      .cim-graph-connections path.cim-connection-preview { stroke:#f3b35e; stroke-dasharray:6 4; filter:none; }
+      .cim-graph-connections path[data-branch="true"] { stroke:#82df78; }
+      .cim-graph-connections path[data-branch="false"] { stroke:#ef7777; }
+      .cim-automation-card { min-height:132px; display:flex; flex-direction:column; }
+      .cim-automation-card .cim-card-name { color:#c26818; }
+      html.dark .cim-automation-card .cim-card-name { color:#f4a85f; }
+      .cim-automation-badge { width:max-content; margin-top:auto; padding:3px 7px; border-radius:999px; color:#a7520a; background:rgba(219,124,38,.13); font-size:9px; font-weight:700; }
+      html.dark .cim-automation-badge { color:#ffc083; background:rgba(219,124,38,.2); }
+      .cim-automation-glyph { width:42px; height:42px; display:grid; place-items:center; border-radius:8px; color:#b55b0d; background:rgba(219,124,38,.14); font-size:23px; font-weight:800; }
+      .cim-automation-mention { display:inline-flex; align-items:center; padding:1px 7px 2px; margin:0 1px; max-width:180px; border:1px solid rgba(219,124,38,.38); border-radius:999px; color:#ad5509; background:rgba(219,124,38,.13); font-weight:650; line-height:1.35; vertical-align:baseline; cursor:default; }
+      html.dark .cim-automation-mention { color:#ffb66f; background:rgba(219,124,38,.21); }
+      .cim-run-status { position:fixed; right:18px; bottom:82px; z-index:2147483030; width:min(350px,calc(100vw - 36px)); padding:12px; border:1px solid rgba(219,124,38,.38); border-radius:14px; color:var(--cim-text); background:var(--cim-panel); box-shadow:0 12px 38px rgba(0,0,0,.25); font-family:system-ui,-apple-system,sans-serif; }
+      .cim-run-status header { display:flex; align-items:center; gap:8px; }
+      .cim-run-status strong { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
+      .cim-run-status button { padding:6px 9px; border:1px solid rgba(219,124,38,.42); border-radius:8px; color:#b55b0d; background:transparent; font-size:10px; font-weight:700; cursor:pointer; }
+      .cim-run-status p { margin:7px 0 0; color:var(--cim-muted); font-size:11px; line-height:1.4; }
+      .cim-run-progress { height:3px; margin-top:9px; overflow:hidden; border-radius:999px; background:rgba(127,127,127,.16); }
+      .cim-run-progress span { display:block; height:100%; background:#db7c26; transition:width .2s; }
+      @media (max-width:680px) { .cim-modal-body, .cim-automation-layout { grid-template-columns:1fr; } .cim-editor { border-right:0; border-bottom:1px solid var(--cim-border); } .cim-modal { max-height:94vh; } }
     `;
     document.head.appendChild(style);
   }
@@ -204,6 +347,10 @@
         if (!db.objectStoreNames.contains(TAG_STORE_NAME)) {
           const tagStore = db.createObjectStore(TAG_STORE_NAME, { keyPath: 'id' });
           tagStore.createIndex('nameLower', 'nameLower', { unique: true });
+        }
+        if (!db.objectStoreNames.contains(AUTOMATION_STORE_NAME)) {
+          const automationStore = db.createObjectStore(AUTOMATION_STORE_NAME, { keyPath: 'id' });
+          automationStore.createIndex('nameLower', 'nameLower', { unique: true });
         }
       };
       request.onsuccess = () => resolve(request.result);
@@ -233,6 +380,13 @@
     state.tags.sort((a, b) => a.name.localeCompare(b.name));
     state.tagById = new Map(state.tags.map((tag) => [tag.id, tag]));
     state.tagByName = new Map(state.tags.map((tag) => [tag.nameLower, tag]));
+  }
+
+  async function loadAutomations() {
+    state.automations = await dbRequest('readonly', (store) => store.getAll(), AUTOMATION_STORE_NAME);
+    state.automations.sort((a, b) => a.name.localeCompare(b.name));
+    state.automationById = new Map(state.automations.map((automation) => [automation.id, automation]));
+    state.automationByName = new Map(state.automations.map((automation) => [automation.nameLower, automation]));
   }
 
   function rebuildIndexes() {
@@ -267,10 +421,20 @@
     try {
       const parsed = JSON.parse(localStorage.getItem(HISTORY_RESTORATIONS_KEY) || '[]');
       state.historyRestorations = Array.isArray(parsed)
-        ? parsed.filter((entry) => typeof entry?.expandedText === 'string' && Array.isArray(entry.restorations))
+        ? parsed.filter((entry) =>
+          typeof entry?.expandedText === 'string'
+          && Array.isArray(entry.restorations)
+          && typeof entry.turnId === 'string'
+          && entry.turnId)
         : [];
+      // Text-only legacy entries could rewrite an unrelated ChatGPT message that
+      // happened to contain the same words. Keep only turn-scoped cache records.
+      if (!Array.isArray(parsed) || state.historyRestorations.length !== parsed.length) {
+        localStorage.setItem(HISTORY_RESTORATIONS_KEY, JSON.stringify(state.historyRestorations));
+      }
     } catch (error) {
       state.historyRestorations = [];
+      localStorage.removeItem(HISTORY_RESTORATIONS_KEY);
       console.error('[Prompt Forge] Could not load history chip metadata', error);
     }
   }
@@ -283,11 +447,13 @@
         kind: item.kind, name: item.name, expanded: item.expanded,
         note: item.note || '', text: item.text || '', id: item.id || '',
       })),
+      turnId: restoration.turnId || '',
       createdAt: Date.now(),
     };
+    if (!entry.turnId) return;
     const candidates = [
       entry,
-      ...state.historyRestorations.filter((item) => item.expandedText !== entry.expandedText),
+      ...state.historyRestorations.filter((item) => item.turnId !== entry.turnId),
     ];
     const retained = [];
     let totalChars = 0;
@@ -405,6 +571,8 @@
         <nav class="cim-tabs" aria-label="Mention types">
           <button type="button" data-cim-tab="files" role="tab" aria-selected="true">@ Files &amp; images</button>
           <button type="button" data-cim-tab="tags" role="tab" aria-selected="false"># Prompt tags</button>
+          <button type="button" data-cim-tab="automate" role="tab" aria-selected="false">! Workflow</button>
+          <button type="button" data-cim-tab="options" role="tab" aria-selected="false">Options</button>
         </nav>
         <div class="cim-modal-body" data-cim-panel="files">
           <form class="cim-editor" id="cim-editor-form">
@@ -446,6 +614,64 @@
             <div class="cim-grid" id="cim-tag-grid"></div>
           </section>
         </div>
+        <div class="cim-workflow-host cim-hidden" data-cim-panel="automate">
+          <section class="cim-workflow-home" id="cim-workflow-home">
+            <div class="cim-workflow-home-header"><div><h3>Workflows</h3><p>Build reusable prompt graphs and invoke them with <b>!name</b>.</p></div><button type="button" class="cim-primary" data-new-workflow>+ New workflow</button></div>
+            <div class="cim-library-title"><strong>Your workflows</strong><span id="cim-automation-count"></span></div>
+            <div class="cim-grid" id="cim-automation-grid"></div>
+          </section>
+          <form id="cim-automation-form" class="cim-workflow-panel cim-hidden">
+            <header class="cim-workflow-toolbar">
+              <button type="button" class="cim-secondary" data-close-workflow-designer>← Workflows</button>
+              <label class="cim-field"><span>Workflow chip</span><input id="cim-automation-name" maxlength="40" autocomplete="off" placeholder="video-pipeline" required pattern="[A-Za-z0-9_-]+"></label>
+              <label class="cim-field"><span>Description</span><input id="cim-automation-description" maxlength="160" placeholder="Turn an idea into a complete production package."></label>
+              <label class="cim-field"><span>Timeout (min)</span><input id="cim-automation-timeout" type="number" min="1" max="60" value="15"></label>
+              <div class="cim-workflow-toolbar-actions"><button class="cim-primary" id="cim-automation-save" type="submit">Save workflow</button><button class="cim-secondary cim-hidden" data-cancel-automation-edit type="button">Cancel edit</button></div>
+            </header>
+            <div class="cim-workflow-workspace">
+              <aside class="cim-workflow-sidebar">
+                <h3>+ Add node</h3>
+                <div class="cim-skill-palette" aria-label="Workflow nodes">
+                  <button type="button" data-add-automation-node="prompt">Prompt</button>
+                  <button type="button" data-add-automation-node="delay">Delay</button>
+                  <button type="button" data-add-automation-node="image">Generated Image</button>
+                  <button type="button" data-add-automation-node="condition">If / Else</button>
+                  <button type="button" data-add-automation-node="approval">Approval</button>
+                  <button type="button" data-add-automation-node="foreach">For Each</button>
+                  <button type="button" data-add-automation-node="validate">Retry / Validate</button>
+                  <button type="button" data-add-automation-node="extract">Extract Variable</button>
+                  <button type="button" data-add-automation-node="subflow">Run Workflow</button>
+                </div>
+                <h3>Variables</h3>
+                <div class="cim-variable-tools">
+                  <button type="button" data-insert-automation-variable="input">{{input}}</button>
+                  <button type="button" data-insert-automation-variable="last">{{last}}</button>
+                  <button type="button" data-insert-automation-variable="lastImage">{{lastImage}}</button>
+                </div>
+              </aside>
+              <section class="cim-graph-shell">
+                <div class="cim-graph-toolbar"><strong>Workflow Graph</strong><small>Connect dots to route · click a line to sever</small><button type="button" data-graph-zoom-out aria-label="Zoom out">−</button><button type="button" data-graph-zoom-label>100%</button><button type="button" data-graph-zoom-in aria-label="Zoom in">+</button><button type="button" data-graph-fit>Fit</button></div>
+                <div class="cim-graph-viewport" id="cim-graph-viewport">
+                  <div class="cim-graph-canvas" id="cim-graph-canvas">
+                    <svg class="cim-graph-connections" id="cim-graph-connections" aria-hidden="true"></svg>
+                    <div class="cim-node-graph" id="cim-automation-nodes"></div>
+                  </div>
+                </div>
+              </section>
+            </div>
+          </form>
+        </div>
+        <section class="cim-settings-panel cim-hidden" data-cim-panel="options">
+          <h3>Options</h3>
+          <p>Configure how Prompt Forge behaves while running workflows.</p>
+          <label class="cim-setting-toggle">
+            <input id="cim-retry-on-error" type="checkbox">
+            <span>
+              <strong>Retry on error</strong>
+              <small>When ChatGPT reports a temporary image-generation error, resend the same workflow prompt once. Policy refusals are not retried.</small>
+            </span>
+          </label>
+        </section>
       </section>`;
     document.body.appendChild(backdrop);
 
@@ -467,9 +693,16 @@
     }));
     backdrop.querySelector('[data-cancel-file-edit]').addEventListener('click', () => { resetEditor(); document.querySelector('#cim-nickname')?.focus(); });
     backdrop.querySelector('[data-cancel-tag-edit]').addEventListener('click', () => { resetTagEditor(); document.querySelector('#cim-tag-name')?.focus(); });
+    backdrop.querySelector('[data-cancel-automation-edit]').addEventListener('click', closeWorkflowDesigner);
+    backdrop.querySelector('[data-close-workflow-designer]').addEventListener('click', closeWorkflowDesigner);
+    backdrop.querySelector('[data-new-workflow]').addEventListener('click', () => openWorkflowDesigner());
     backdrop.querySelector('#cim-tag-random-enabled').addEventListener('change', updateTagRandomPoolState);
     backdrop.querySelector('#cim-tag-random-count').addEventListener('input', updateTagRandomPoolState);
     backdrop.querySelector('#cim-tag-random-pool').addEventListener('change', updateTagRandomPoolState);
+    backdrop.querySelector('#cim-retry-on-error').addEventListener('change', (event) => {
+      state.retryOnError = event.target.checked;
+      localStorage.setItem(RETRY_ON_ERROR_KEY, String(state.retryOnError));
+    });
     backdrop.addEventListener('mousedown', (event) => { if (event.target === backdrop) closeModal(); });
     dropzone.addEventListener('click', () => fileInput.click());
     dropzone.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') fileInput.click(); });
@@ -479,6 +712,24 @@
     dropzone.addEventListener('drop', (event) => setPendingFile(event.dataTransfer.files[0]));
     backdrop.querySelector('#cim-editor-form').addEventListener('submit', saveEditor);
     backdrop.querySelector('#cim-tag-form').addEventListener('submit', saveTagEditor);
+    backdrop.querySelector('#cim-automation-form').addEventListener('submit', saveAutomationEditor);
+    backdrop.querySelectorAll('[data-add-automation-node]').forEach((button) => button.addEventListener('click', () => appendAutomationNode(button.dataset.addAutomationNode)));
+    backdrop.querySelectorAll('[data-insert-automation-variable]').forEach((button) => {
+      button.addEventListener('mousedown', (event) => event.preventDefault());
+      button.addEventListener('click', () => insertAutomationVariable(button.dataset.insertAutomationVariable));
+    });
+    backdrop.querySelector('#cim-automation-nodes').addEventListener('click', handleAutomationNodeAction);
+    backdrop.querySelector('#cim-automation-nodes').addEventListener('pointerdown', handleWorkflowNodePointerDown);
+    backdrop.querySelector('#cim-graph-connections').addEventListener('click', handleWorkflowConnectionClick);
+    backdrop.querySelector('#cim-graph-viewport').addEventListener('pointerdown', handleWorkflowCanvasPointerDown);
+    backdrop.querySelector('#cim-graph-viewport').addEventListener('wheel', (event) => {
+      if (!event.ctrlKey) return;
+      event.preventDefault();
+      setWorkflowZoom(state.workflowZoom + (event.deltaY < 0 ? .1 : -.1));
+    }, { passive: false });
+    backdrop.querySelector('[data-graph-zoom-in]').addEventListener('click', () => setWorkflowZoom(state.workflowZoom + .1));
+    backdrop.querySelector('[data-graph-zoom-out]').addEventListener('click', () => setWorkflowZoom(state.workflowZoom - .1));
+    backdrop.querySelector('[data-graph-fit]').addEventListener('click', fitWorkflowGraph);
   }
 
   function openModal() {
@@ -487,11 +738,17 @@
     if (!backdrop) return toast('The mentions library could not be opened. Refresh ChatGPT and try again.');
     resetEditor();
     resetTagEditor();
+    closeWorkflowDesigner();
     renderLibrary();
     renderTagLibrary();
+    renderAutomationLibrary();
+    renderOptions();
     switchModalTab(state.modalTab);
     backdrop.classList.remove('cim-hidden');
-    document.querySelector(state.modalTab === 'tags' ? '#cim-tag-name' : '#cim-nickname')?.focus();
+    const focusTarget = state.modalTab === 'tags' ? '#cim-tag-name'
+      : state.modalTab === 'automate' ? '[data-new-workflow]'
+        : state.modalTab === 'options' ? '#cim-retry-on-error' : '#cim-nickname';
+    document.querySelector(focusTarget)?.focus();
   }
 
   function closeModal() {
@@ -499,14 +756,22 @@
     closeAutocomplete();
     resetEditor();
     resetTagEditor();
+    closeWorkflowDesigner();
     requestAnimationFrame(() => hydrateStoredReferences(getEditor()));
   }
 
   function switchModalTab(tab) {
     closeAutocomplete();
-    state.modalTab = tab === 'tags' ? 'tags' : 'files';
+    state.modalTab = ['files', 'tags', 'automate', 'options'].includes(tab) ? tab : 'files';
+    if (state.modalTab !== 'automate') closeWorkflowDesigner();
     document.querySelectorAll('[data-cim-tab]').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.cimTab === state.modalTab)));
     document.querySelectorAll('[data-cim-panel]').forEach((panel) => panel.classList.toggle('cim-hidden', panel.dataset.cimPanel !== state.modalTab));
+    if (state.modalTab === 'automate') requestAnimationFrame(() => { setWorkflowZoom(state.workflowZoom); scheduleWorkflowConnections(); });
+  }
+
+  function renderOptions() {
+    const retryOnError = document.querySelector('#cim-retry-on-error');
+    if (retryOnError) retryOnError.checked = state.retryOnError;
   }
 
   function resetEditor() {
@@ -764,6 +1029,603 @@
     toast(`Deleted #${tag.name}`);
   }
 
+  function automationNodeMarkup(node = { type: 'prompt' }) {
+    const allowedTypes = new Set(['prompt', 'delay', 'image', 'condition', 'approval', 'foreach', 'validate', 'extract', 'subflow']);
+    const type = allowedTypes.has(node.type) ? node.type : 'prompt';
+    const id = node.id || shortId();
+    const x = Math.max(20, Number(node.x) || 40);
+    const y = Math.max(20, Number(node.y) || 50);
+    const position = `data-node-x="${x}" data-node-y="${y}" style="transform:translate3d(${x}px,${y}px,0)"`;
+    const selected = (value, expected) => value === expected ? ' selected' : '';
+    const header = (label, hasOutput = true) => `<div class="cim-node-header"><span class="cim-node-pin cim-node-pin-input"></span><span class="cim-node-order">01</span><span class="cim-node-type">${label}</span><button type="button" data-node-up title="Earlier in execution">←</button><button type="button" data-node-down title="Later in execution">→</button><button type="button" data-node-delete title="Delete node">×</button>${hasOutput ? '<span class="cim-node-pin cim-node-pin-output" data-branch="next"></span>' : ''}</div>`;
+    if (type === 'delay') {
+      return `<article class="cim-node" ${position} data-node-id="${id}" data-node-type="delay">
+        ${header('Delay')}
+        <div class="cim-node-options"><label>Wait <input data-node-seconds type="number" min="1" max="3600" value="${Math.min(3600, Math.max(1, Number(node.seconds) || 5))}"> seconds before continuing</label></div>
+      </article>`;
+    }
+    if (type === 'image') {
+      return `<article class="cim-node" ${position} data-node-id="${id}" data-node-type="image">
+        ${header('Generated Image · capture')}
+        <div class="cim-node-fields"><label class="cim-field cim-field-wide"><span>Save the latest generated image as</span><input data-node-image-name maxlength="40" value="${escapeHtml(node.name || 'image')}" placeholder="hero"></label></div>
+        <p class="cim-help">Use it later as <b>{{image:${escapeHtml(node.name || 'image')}}}</b>. <b>{{lastImage}}</b> always refers to the newest generated image.</p>
+      </article>`;
+    }
+    if (type === 'condition') {
+      return `<article class="cim-node" ${position} data-node-id="${id}" data-node-type="condition">
+        ${header('If / Else · route', false)}
+        <div class="cim-branch-port cim-branch-port-true"><span>True</span><i class="cim-node-pin cim-node-pin-output" data-branch="true"></i></div>
+        <div class="cim-branch-port cim-branch-port-false"><span>False</span><i class="cim-node-pin cim-node-pin-output" data-branch="false"></i></div>
+        <div class="cim-node-fields">
+          <label class="cim-field cim-field-wide"><span>Value to test</span><input data-node-condition-source value="${escapeHtml(node.source || '{{last}}')}" placeholder="{{last}} or {{var:score}}"></label>
+          <label class="cim-field"><span>Condition</span><select data-node-operator>
+            <option value="contains"${selected(node.operator, 'contains')}>Contains</option><option value="not_contains"${selected(node.operator, 'not_contains')}>Does not contain</option>
+            <option value="equals"${selected(node.operator, 'equals')}>Equals</option><option value="not_empty"${selected(node.operator, 'not_empty')}>Is not empty</option>
+            <option value="regex"${selected(node.operator, 'regex')}>Matches regex</option><option value="image_exists"${selected(node.operator, 'image_exists')}>Image exists</option>
+          </select></label>
+          <label class="cim-field"><span>Expected text / regex</span><input data-node-expected value="${escapeHtml(node.expected || '')}" placeholder="approved"></label>
+        </div>
+        <p class="cim-help">Connect the True and False dots to the nodes each result should run next. An unconnected result ends the workflow.</p>
+      </article>`;
+    }
+    if (type === 'approval') {
+      return `<article class="cim-node" ${position} data-node-id="${id}" data-node-type="approval">
+        ${header('Approval · pause for review')}
+        <label class="cim-field"><span>Checkpoint message</span><input data-node-approval-message maxlength="240" value="${escapeHtml(node.message || 'Review the latest result before continuing.')}" placeholder="Approve the script before image generation."></label>
+        <p class="cim-help">The run panel offers Continue, Retry last prompt, Edit last output, and Stop.</p>
+      </article>`;
+    }
+    if (type === 'foreach') {
+      return `<article class="cim-node" ${position} data-node-id="${id}" data-node-type="foreach">
+        ${header('For Each · list prompt')}
+        <label class="cim-field"><span>Items (one per line, JSON array, or variable)</span><textarea data-node-list-source maxlength="12000" placeholder="{{input}}">${escapeHtml(node.source || '{{input}}')}</textarea></label>
+        <label class="cim-field"><span>Prompt sent for each item</span><textarea data-node-template maxlength="12000" required placeholder="Create a scene for {{item}} ({{index}} of {{itemTotal}}).">${escapeHtml(node.template || '')}</textarea></label>
+      </article>`;
+    }
+    if (type === 'validate') {
+      return `<article class="cim-node" ${position} data-node-id="${id}" data-node-type="validate">
+        ${header('Retry / Validate · quality gate')}
+        <div class="cim-node-fields">
+          <label class="cim-field cim-field-wide"><span>Value to validate</span><input data-node-validation-source value="${escapeHtml(node.source || '{{last}}')}" placeholder="{{last}}"></label>
+          <label class="cim-field"><span>Rule</span><select data-node-operator>
+            <option value="not_empty"${selected(node.operator || 'not_empty', 'not_empty')}>Is not empty</option><option value="contains"${selected(node.operator, 'contains')}>Contains</option>
+            <option value="not_contains"${selected(node.operator, 'not_contains')}>Does not contain</option><option value="equals"${selected(node.operator, 'equals')}>Equals</option>
+            <option value="regex"${selected(node.operator, 'regex')}>Matches regex</option><option value="image_exists"${selected(node.operator, 'image_exists')}>Image exists</option>
+          </select></label>
+          <label class="cim-field"><span>Expected text / regex</span><input data-node-expected value="${escapeHtml(node.expected || '')}"></label>
+          <label class="cim-field"><span>Maximum retries</span><input data-node-retries type="number" min="1" max="10" value="${Math.min(10, Math.max(1, Number(node.retries) || 2))}"></label>
+        </div>
+        <p class="cim-help">If validation fails, the previous prompt is sent again until it passes or retries run out.</p>
+      </article>`;
+    }
+    if (type === 'extract') {
+      return `<article class="cim-node" ${position} data-node-id="${id}" data-node-type="extract">
+        ${header('Extract Variable · parse output')}
+        <div class="cim-node-fields">
+          <label class="cim-field"><span>Variable name</span><input data-node-variable-name maxlength="40" value="${escapeHtml(node.name || 'result')}" placeholder="script"></label>
+          <label class="cim-field"><span>Extraction mode</span><select data-node-extract-mode><option value="full"${selected(node.mode || 'full', 'full')}>Entire value</option><option value="regex"${selected(node.mode, 'regex')}>Regex capture</option><option value="json"${selected(node.mode, 'json')}>JSON path</option></select></label>
+          <label class="cim-field cim-field-wide"><span>Source</span><textarea data-node-extract-source maxlength="12000">${escapeHtml(node.source || '{{last}}')}</textarea></label>
+          <label class="cim-field cim-field-wide"><span>Regex or JSON path</span><input data-node-extract-pattern value="${escapeHtml(node.pattern || '')}" placeholder="Title:\\s*(.+) or scenes.0.title"></label>
+        </div>
+        <p class="cim-help">Reference the saved value later with <b>{{var:${escapeHtml(node.name || 'result')}}}</b>.</p>
+      </article>`;
+    }
+    if (type === 'subflow') {
+      const targetId = node.automationId || '';
+      const targets = [...state.automations];
+      if (targetId && !targets.some((automation) => automation.id === targetId)) targets.push({ id: targetId, name: 'Missing workflow' });
+      return `<article class="cim-node" ${position} data-node-id="${id}" data-node-type="subflow">
+        ${header('Run Workflow · sub-graph')}
+        <label class="cim-field"><span>Workflow</span><select data-node-automation-id><option value="">Choose a workflow</option>${targets.map((automation) => `<option value="${escapeHtml(automation.id)}"${selected(targetId, automation.id)}>!${escapeHtml(automation.name)}</option>`).join('')}</select></label>
+        <label class="cim-field"><span>Input passed to it</span><textarea data-node-template maxlength="12000">${escapeHtml(node.input || '{{input}}')}</textarea></label>
+        <p class="cim-help">Nested workflows share outputs and variables. Recursive loops and nesting deeper than five levels are blocked.</p>
+      </article>`;
+    }
+    return `<article class="cim-node" ${position} data-node-id="${id}" data-node-type="prompt">
+      ${header('Prompt · waits for completion')}
+      <label class="cim-field"><span>What should be sent?</span><textarea data-node-template maxlength="12000" required placeholder="Create an image for: {{input}}">${escapeHtml(node.template || '')}</textarea></label>
+      <div class="cim-node-options"><label>Run <input data-node-repeat type="number" min="1" max="50" value="${Math.min(50, Math.max(1, Number(node.repeat) || 1))}"> time(s)</label><span>Each repeat waits for the full response.</span></div>
+    </article>`;
+  }
+
+  function appendAutomationNode(type = 'prompt', node = null) {
+    const graph = document.querySelector('#cim-automation-nodes');
+    if (!graph) return;
+    const count = graph.children.length;
+    const previous = graph.lastElementChild;
+    const positioned = node || {
+      type,
+      x: 50 + (count % 4) * 340,
+      y: 60 + Math.floor(count / 4) * 300,
+    };
+    graph.insertAdjacentHTML('beforeend', automationNodeMarkup(positioned));
+    const added = graph.lastElementChild;
+    if (previous && added) {
+      const branch = previous.dataset.nodeType === 'condition' ? 'true' : 'next';
+      if (!state.workflowConnections.some((connection) => connection.from === previous.dataset.nodeId && connection.branch === branch)) {
+        state.workflowConnections.push({ from: previous.dataset.nodeId, to: added.dataset.nodeId, branch });
+      }
+    }
+    observeWorkflowNodeSizes(false);
+    updateAutomationNodeOrder();
+    added?.querySelector('textarea, input')?.focus();
+  }
+
+  function defaultWorkflowConnections(nodes) {
+    const connections = [];
+    nodes.forEach((node, index) => {
+      if (node.type !== 'condition') {
+        if (nodes[index + 1]) connections.push({ from: node.id, to: nodes[index + 1].id, branch: 'next' });
+        return;
+      }
+      for (const branch of ['true', 'false']) {
+        const action = node[`${branch}Action`] || (branch === 'true' ? 'continue' : 'skip');
+        if (action === 'stop') continue;
+        const skip = action === 'skip' ? Math.min(50, Math.max(1, Number(node[`${branch}Skip`]) || 1)) : 0;
+        const target = nodes[index + skip + 1];
+        if (target) connections.push({ from: node.id, to: target.id, branch });
+      }
+    });
+    return connections;
+  }
+
+  function sanitizeWorkflowConnections(connections, nodes) {
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    const slots = new Set();
+    const clean = [];
+    for (const connection of Array.isArray(connections) ? connections : []) {
+      const source = byId.get(connection?.from);
+      if (!source || !byId.has(connection?.to) || connection.from === connection.to) continue;
+      const branch = source.type === 'condition' && ['true', 'false'].includes(connection.branch)
+        ? connection.branch
+        : source.type === 'condition' ? 'true' : 'next';
+      const slot = `${connection.from}:${branch}`;
+      if (slots.has(slot)) continue;
+      slots.add(slot);
+      clean.push({ from: connection.from, to: connection.to, branch });
+    }
+    return clean;
+  }
+
+  function setAutomationNodes(nodes, connections) {
+    const graph = document.querySelector('#cim-automation-nodes');
+    if (!graph) return;
+    const prepared = (Array.isArray(nodes) ? nodes : []).map((node, index) => ({
+      ...node,
+      id: node.id || shortId(),
+      x: Number(node.x) || 50 + (index % 4) * 340,
+      y: Number(node.y) || 60 + Math.floor(index / 4) * 300,
+    }));
+    state.workflowConnections = sanitizeWorkflowConnections(
+      Array.isArray(connections) ? connections : defaultWorkflowConnections(prepared),
+      prepared,
+    );
+    graph.innerHTML = prepared.map((node) => automationNodeMarkup(node)).join('');
+    observeWorkflowNodeSizes(true);
+    updateAutomationNodeOrder();
+  }
+
+  function observeWorkflowNodeSizes(reset = false) {
+    if (!('ResizeObserver' in window)) return;
+    if (!state.workflowResizeObserver) state.workflowResizeObserver = new ResizeObserver(scheduleWorkflowConnections);
+    if (reset) state.workflowResizeObserver.disconnect();
+    document.querySelectorAll('#cim-automation-nodes .cim-node').forEach((node) => state.workflowResizeObserver.observe(node));
+  }
+
+  function readAutomationNodes() {
+    return [...document.querySelectorAll('#cim-automation-nodes .cim-node')].map((element) => {
+      const type = element.dataset.nodeType;
+      const value = (selector) => element.querySelector(selector)?.value?.trim() || '';
+      const base = {
+        id: element.dataset.nodeId || shortId(), type,
+        x: Math.max(20, Math.round(Number(element.dataset.nodeX) || 40)),
+        y: Math.max(20, Math.round(Number(element.dataset.nodeY) || 50)),
+      };
+      if (type === 'delay') {
+        return { ...base, seconds: Math.min(3600, Math.max(1, Number(element.querySelector('[data-node-seconds]')?.value) || 1)) };
+      }
+      if (type === 'image') return { ...base, name: value('[data-node-image-name]') };
+      if (type === 'condition') {
+        return {
+          ...base, source: value('[data-node-condition-source]'),
+          operator: value('[data-node-operator]'), expected: value('[data-node-expected]'),
+        };
+      }
+      if (type === 'approval') return { ...base, message: value('[data-node-approval-message]') };
+      if (type === 'foreach') return { ...base, source: value('[data-node-list-source]'), template: value('[data-node-template]') };
+      if (type === 'validate') {
+        return {
+          ...base, source: value('[data-node-validation-source]'),
+          operator: value('[data-node-operator]'), expected: value('[data-node-expected]'),
+          retries: Math.min(10, Math.max(1, Number(value('[data-node-retries]')) || 1)),
+        };
+      }
+      if (type === 'extract') {
+        return {
+          ...base, name: value('[data-node-variable-name]'),
+          mode: value('[data-node-extract-mode]'), source: value('[data-node-extract-source]'),
+          pattern: value('[data-node-extract-pattern]'),
+        };
+      }
+      if (type === 'subflow') {
+        return {
+          ...base,
+          automationId: value('[data-node-automation-id]'), input: value('[data-node-template]'),
+        };
+      }
+      return {
+        ...base, type: 'prompt',
+        template: element.querySelector('[data-node-template]')?.value.trim() || '',
+        repeat: Math.min(50, Math.max(1, Number(element.querySelector('[data-node-repeat]')?.value) || 1)),
+      };
+    });
+  }
+
+  function readWorkflowConnections() {
+    return sanitizeWorkflowConnections(state.workflowConnections, readAutomationNodes());
+  }
+
+  function scheduleWorkflowConnections() {
+    if (state.workflowConnectionFrame) return;
+    state.workflowConnectionFrame = requestAnimationFrame(() => {
+      state.workflowConnectionFrame = null;
+      updateWorkflowConnections();
+    });
+  }
+
+  function updateAutomationNodeOrder() {
+    document.querySelectorAll('#cim-automation-nodes .cim-node').forEach((node, index) => {
+      const order = node.querySelector('.cim-node-order');
+      if (order) order.textContent = String(index + 1).padStart(2, '0');
+      node.classList.remove('cim-node-dragging');
+    });
+    scheduleWorkflowConnections();
+  }
+
+  function handleAutomationNodeAction(event) {
+    const node = event.target.closest('.cim-node');
+    if (!node) return;
+    if (event.target.closest('[data-node-delete]')) {
+      const id = node.dataset.nodeId;
+      state.workflowConnections = state.workflowConnections.filter((connection) => connection.from !== id && connection.to !== id);
+      node.remove();
+    }
+    else if (event.target.closest('[data-node-up]') && node.previousElementSibling) node.parentElement.insertBefore(node, node.previousElementSibling);
+    else if (event.target.closest('[data-node-down]') && node.nextElementSibling) node.parentElement.insertBefore(node.nextElementSibling, node);
+    else return;
+    updateAutomationNodeOrder();
+  }
+
+  function updateWorkflowConnections() {
+    const graph = document.querySelector('#cim-automation-nodes');
+    const canvas = document.querySelector('#cim-graph-canvas');
+    const svg = document.querySelector('#cim-graph-connections');
+    if (!graph || !canvas || !svg) return;
+    const nodes = [...graph.querySelectorAll('.cim-node')];
+    const byId = new Map(nodes.map((node) => [node.dataset.nodeId, node]));
+    let width = 1800;
+    let height = 1100;
+    for (const node of nodes) {
+      const x = Number(node.dataset.nodeX) || 0;
+      const y = Number(node.dataset.nodeY) || 0;
+      width = Math.max(width, x + node.offsetWidth + 220);
+      height = Math.max(height, y + node.offsetHeight + 180);
+    }
+    const widthPx = `${width}px`;
+    const heightPx = `${height}px`;
+    if (canvas.style.width !== widthPx) canvas.style.width = widthPx;
+    if (canvas.style.height !== heightPx) canvas.style.height = heightPx;
+    const viewBox = `0 0 ${width} ${height}`;
+    if (svg.getAttribute('viewBox') !== viewBox) svg.setAttribute('viewBox', viewBox);
+    const existing = new Map([...svg.querySelectorAll('path[data-key]')].map((path) => [path.dataset.key, path]));
+    const live = new Set();
+    for (const connection of state.workflowConnections) {
+      const source = byId.get(connection.from);
+      const target = byId.get(connection.to);
+      if (!source || !target) continue;
+      const key = `${connection.from}:${connection.branch}:${connection.to}`;
+      live.add(key);
+      let path = existing.get(key);
+      if (!path) {
+        path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        svg.appendChild(path);
+      }
+      const pin = source.querySelector(`.cim-node-pin-output[data-branch="${connection.branch}"]`)
+        || source.querySelector('.cim-node-pin-output');
+      const x1 = (Number(source.dataset.nodeX) || 0) + source.offsetWidth;
+      const branchPort = pin?.closest('.cim-branch-port');
+      const pinTop = branchPort ? branchPort.offsetTop + pin.offsetTop : (pin?.offsetTop || 11);
+      const y1 = (Number(source.dataset.nodeY) || 0) + pinTop + (pin?.offsetHeight || 10) / 2;
+      const x2 = Number(target.dataset.nodeX) || 0;
+      const input = target.querySelector('.cim-node-pin-input');
+      const y2 = (Number(target.dataset.nodeY) || 0) + (input?.offsetTop || 11) + (input?.offsetHeight || 10) / 2;
+      const curve = Math.max(65, Math.abs(x2 - x1) * .45);
+      path.dataset.key = key;
+      path.dataset.from = connection.from;
+      path.dataset.to = connection.to;
+      path.dataset.branch = connection.branch;
+      path.setAttribute('d', `M ${x1} ${y1} C ${x1 + curve} ${y1}, ${x2 - curve} ${y2}, ${x2} ${y2}`);
+    }
+    for (const [key, path] of existing) {
+      if (!live.has(key)) path.remove();
+    }
+  }
+
+  function handleWorkflowNodePointerDown(event) {
+    const outputPin = event.target.closest('.cim-node-pin-output');
+    if (outputPin) {
+      const sourceNode = outputPin.closest('.cim-node');
+      if (sourceNode) startWorkflowConnection(event, sourceNode, outputPin.dataset.branch || 'next');
+      return;
+    }
+    const header = event.target.closest('.cim-node-header');
+    const node = header?.closest('.cim-node');
+    if (!node || event.target.closest('button, input, textarea, select')) return;
+    if (event.target.closest('.cim-node-pin')) return;
+    event.preventDefault();
+    node.setPointerCapture?.(event.pointerId);
+    node.classList.add('cim-node-dragging');
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const originalX = Number(node.dataset.nodeX) || 40;
+    const originalY = Number(node.dataset.nodeY) || 50;
+    const zoom = state.workflowZoom || 1;
+    const move = (moveEvent) => {
+      const x = Math.max(20, Math.round(originalX + (moveEvent.clientX - startX) / zoom));
+      const y = Math.max(20, Math.round(originalY + (moveEvent.clientY - startY) / zoom));
+      node.dataset.nodeX = String(x);
+      node.dataset.nodeY = String(y);
+      node.style.transform = `translate3d(${x}px,${y}px,0)`;
+      scheduleWorkflowConnections();
+    };
+    const end = () => {
+      node.classList.remove('cim-node-dragging');
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', end);
+      scheduleWorkflowConnections();
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end, { once: true });
+  }
+
+  function startWorkflowConnection(event, sourceNode, branch = 'next') {
+    event.preventDefault();
+    event.stopPropagation();
+    const canvas = document.querySelector('#cim-graph-canvas');
+    const svg = document.querySelector('#cim-graph-connections');
+    if (!canvas || !svg) return;
+    const preview = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    preview.classList.add('cim-connection-preview');
+    svg.appendChild(preview);
+    const sourcePin = sourceNode.querySelector(`.cim-node-pin-output[data-branch="${branch}"]`) || event.target;
+    const x1 = (Number(sourceNode.dataset.nodeX) || 0) + sourceNode.offsetWidth;
+    const branchPort = sourcePin.closest('.cim-branch-port');
+    const pinTop = branchPort ? branchPort.offsetTop + sourcePin.offsetTop : (sourcePin.offsetTop || 11);
+    const y1 = (Number(sourceNode.dataset.nodeY) || 0) + pinTop + (sourcePin.offsetHeight || 10) / 2;
+    const move = (moveEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      const x2 = (moveEvent.clientX - rect.left) / (state.workflowZoom || 1);
+      const y2 = (moveEvent.clientY - rect.top) / (state.workflowZoom || 1);
+      const curve = Math.max(65, Math.abs(x2 - x1) * .45);
+      preview.setAttribute('d', `M ${x1} ${y1} C ${x1 + curve} ${y1}, ${x2 - curve} ${y2}, ${x2} ${y2}`);
+    };
+    const end = (upEvent) => {
+      window.removeEventListener('pointermove', move);
+      preview.remove();
+      const inputPin = document.elementFromPoint(upEvent.clientX, upEvent.clientY)?.closest('.cim-node-pin-input');
+      const targetNode = inputPin?.closest('.cim-node');
+      if (targetNode && targetNode !== sourceNode) {
+        state.workflowConnections = state.workflowConnections.filter((connection) =>
+          !(connection.from === sourceNode.dataset.nodeId && connection.branch === branch));
+        state.workflowConnections.push({
+          from: sourceNode.dataset.nodeId,
+          to: targetNode.dataset.nodeId,
+          branch,
+        });
+      }
+      scheduleWorkflowConnections();
+    };
+    move(event);
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end, { once: true });
+  }
+
+  function handleWorkflowConnectionClick(event) {
+    const path = event.target.closest('path[data-key]');
+    if (!path) return;
+    event.preventDefault();
+    event.stopPropagation();
+    state.workflowConnections = state.workflowConnections.filter((connection) =>
+      !(connection.from === path.dataset.from
+        && connection.to === path.dataset.to
+        && connection.branch === path.dataset.branch));
+    path.remove();
+    scheduleWorkflowConnections();
+    toast('Connection removed.');
+  }
+
+  function handleWorkflowCanvasPointerDown(event) {
+    const viewport = event.currentTarget;
+    if (event.target.closest('.cim-node, path[data-key], button, input, textarea, select')) return;
+    event.preventDefault();
+    viewport.classList.add('cim-panning');
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const scrollLeft = viewport.scrollLeft;
+    const scrollTop = viewport.scrollTop;
+    const move = (moveEvent) => {
+      viewport.scrollLeft = scrollLeft - (moveEvent.clientX - startX);
+      viewport.scrollTop = scrollTop - (moveEvent.clientY - startY);
+    };
+    const end = () => {
+      viewport.classList.remove('cim-panning');
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', end);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end, { once: true });
+  }
+
+  function setWorkflowZoom(value) {
+    state.workflowZoom = Math.min(1.5, Math.max(.5, Math.round(value * 10) / 10));
+    const canvas = document.querySelector('#cim-graph-canvas');
+    if (canvas) canvas.style.zoom = String(state.workflowZoom);
+    const label = document.querySelector('[data-graph-zoom-label]');
+    if (label) label.textContent = `${Math.round(state.workflowZoom * 100)}%`;
+    scheduleWorkflowConnections();
+  }
+
+  function fitWorkflowGraph() {
+    setWorkflowZoom(.8);
+    const viewport = document.querySelector('#cim-graph-viewport');
+    if (viewport) { viewport.scrollLeft = 0; viewport.scrollTop = 0; }
+  }
+
+  function insertAutomationVariable(variable) {
+    let textarea = document.activeElement?.matches?.('#cim-automation-nodes [data-node-template]')
+      ? document.activeElement
+      : document.querySelector('#cim-automation-nodes .cim-node:last-child [data-node-template]');
+    if (!textarea) {
+      appendAutomationNode('prompt');
+      textarea = document.querySelector('#cim-automation-nodes .cim-node:last-child [data-node-template]');
+    }
+    if (!textarea) return;
+    const tokenName = variable === 'last' ? 'last' : variable === 'lastImage' ? 'lastImage' : 'input';
+    const token = `{{${tokenName}}}`;
+    const start = textarea.selectionStart ?? textarea.value.length;
+    const end = textarea.selectionEnd ?? start;
+    const leading = start > 0 && !/\s/.test(textarea.value[start - 1]) ? ' ' : '';
+    const trailing = end < textarea.value.length && !/\s/.test(textarea.value[end]) ? ' ' : '';
+    textarea.setRangeText(`${leading}${token}${trailing}`, start, end, 'end');
+    textarea.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: token }));
+    textarea.focus();
+  }
+
+  function resetAutomationEditor() {
+    state.editingAutomationId = null;
+    const form = document.querySelector('#cim-automation-form');
+    if (!form) return;
+    form.reset();
+    const timeout = form.querySelector('#cim-automation-timeout');
+    if (timeout) timeout.value = '15';
+    setAutomationNodes([{ type: 'prompt', repeat: 1, template: '{{input}}' }]);
+    form.querySelector('#cim-automation-save').textContent = 'Save workflow';
+    form.querySelector('[data-cancel-automation-edit]')?.classList.add('cim-hidden');
+  }
+
+  function openWorkflowDesigner(id = null) {
+    resetAutomationEditor();
+    document.querySelector('#cim-workflow-home')?.classList.add('cim-hidden');
+    document.querySelector('#cim-automation-form')?.classList.remove('cim-hidden');
+    document.querySelector('.cim-modal')?.classList.add('cim-workflow-designing');
+    document.querySelector('.cim-modal-backdrop')?.classList.add('cim-workflow-designing-backdrop');
+    if (id) {
+      const automation = state.automationById.get(id);
+      if (!automation) return closeWorkflowDesigner();
+      state.editingAutomationId = id;
+      document.querySelector('#cim-automation-name').value = automation.name;
+      document.querySelector('#cim-automation-description').value = automation.description || '';
+      document.querySelector('#cim-automation-timeout').value = String(automation.timeoutMinutes || 15);
+      setAutomationNodes(automation.nodes || [], automation.connections);
+      document.querySelector('#cim-automation-save').textContent = 'Update workflow';
+      document.querySelector('[data-cancel-automation-edit]')?.classList.remove('cim-hidden');
+    }
+    requestAnimationFrame(() => {
+      fitWorkflowGraph();
+      document.querySelector('#cim-automation-name')?.focus();
+    });
+  }
+
+  function closeWorkflowDesigner() {
+    document.querySelector('#cim-automation-form')?.classList.add('cim-hidden');
+    document.querySelector('#cim-workflow-home')?.classList.remove('cim-hidden');
+    document.querySelector('.cim-modal')?.classList.remove('cim-workflow-designing');
+    document.querySelector('.cim-modal-backdrop')?.classList.remove('cim-workflow-designing-backdrop');
+    resetAutomationEditor();
+    renderAutomationLibrary();
+  }
+
+  async function saveAutomationEditor(event) {
+    event.preventDefault();
+    const name = document.querySelector('#cim-automation-name').value.trim().replace(/^!/, '');
+    const description = document.querySelector('#cim-automation-description').value.trim();
+    const timeoutMinutes = Math.min(60, Math.max(1, Number(document.querySelector('#cim-automation-timeout').value) || 15));
+    const nodes = readAutomationNodes();
+    const connections = readWorkflowConnections();
+    if (!/^[A-Za-z0-9_-]{1,40}$/.test(name)) return toast('Workflow names can only contain letters, numbers, underscores, and hyphens.');
+    if (!nodes.length || !nodes.some((node) => ['prompt', 'foreach', 'subflow'].includes(node.type))) return toast('Add at least one Prompt, For Each, or Run Workflow node.');
+    if (nodes.some((node) => ['prompt', 'foreach'].includes(node.type) && !node.template)) return toast('Every Prompt and For Each node needs prompt text.');
+    if (nodes.some((node) => ['image', 'extract'].includes(node.type) && !/^[A-Za-z0-9_-]{1,40}$/.test(node.name))) return toast('Image and variable names can only contain letters, numbers, underscores, and hyphens.');
+    if (nodes.some((node) => node.type === 'subflow' && !node.automationId)) return toast('Choose a workflow for every Run Workflow node.');
+    const incoming = new Set(connections.map((connection) => connection.to));
+    const roots = nodes.filter((node) => !incoming.has(node.id));
+    if (roots.length !== 1) return toast('Connect the workflow so it has exactly one starting node.');
+    const outgoing = new Map(nodes.map((node) => [node.id, []]));
+    connections.forEach((connection) => outgoing.get(connection.from)?.push(connection.to));
+    const reachable = new Set();
+    const pending = [roots[0].id];
+    while (pending.length) {
+      const id = pending.pop();
+      if (reachable.has(id)) continue;
+      reachable.add(id);
+      pending.push(...(outgoing.get(id) || []));
+    }
+    if (reachable.size !== nodes.length) return toast('Connect every workflow node to the starting node.');
+    const promptRuns = automationPromptRunCount({ nodes });
+    if (promptRuns > 100) return toast('A workflow can run at most 100 prompts.');
+    const duplicate = state.automationByName.get(name.toLocaleLowerCase());
+    if (duplicate && duplicate.id !== state.editingAutomationId) return toast(`!${name} is already in your library.`);
+    const old = state.editingAutomationId ? state.automationById.get(state.editingAutomationId) : null;
+    const automation = {
+      ...(old || {}),
+      id: old?.id || shortId(), name, nameLower: name.toLocaleLowerCase(), description,
+      timeoutMinutes, nodes, connections, createdAt: old?.createdAt || Date.now(), updatedAt: Date.now(),
+    };
+    try {
+      await dbRequest('readwrite', (store) => store.put(automation), AUTOMATION_STORE_NAME);
+      await loadAutomations();
+      closeWorkflowDesigner();
+      toast(`Saved !${name}`);
+    } catch (error) {
+      console.error('[Prompt Forge] Workflow save failed', error);
+      toast('Could not save the workflow.');
+    }
+  }
+
+  function renderAutomationLibrary() {
+    const grid = document.querySelector('#cim-automation-grid');
+    if (!grid) return;
+    document.querySelector('#cim-automation-count').textContent = `${state.automations.length} saved`;
+    if (!state.automations.length) {
+      grid.innerHTML = '<div class="cim-empty">Build a graph, then type its !name followed by your idea.</div>';
+      return;
+    }
+    grid.innerHTML = state.automations.map((automation) => {
+      const promptCount = automationPromptRunCount(automation);
+      return `<article class="cim-card cim-automation-card" data-id="${automation.id}">
+        <div class="cim-card-actions"><button type="button" data-edit-automation aria-label="Edit !${escapeHtml(automation.name)}">${ICONS.edit}</button><button type="button" data-delete-automation aria-label="Delete !${escapeHtml(automation.name)}">${ICONS.trash}</button></div>
+        <div class="cim-card-name">!${escapeHtml(automation.name)}</div><div class="cim-card-note">${escapeHtml(automation.description || truncatePreview((automation.nodes || []).find((node) => ['prompt', 'foreach'].includes(node.type))?.template || '', 180))}</div>
+        <div class="cim-automation-badge">${(automation.nodes || []).length} nodes · ${promptCount} prompt${promptCount === 1 ? '' : 's'}</div>
+      </article>`;
+    }).join('');
+    grid.querySelectorAll('[data-edit-automation]').forEach((button) => button.addEventListener('click', () => editAutomation(button.closest('.cim-automation-card').dataset.id)));
+    grid.querySelectorAll('[data-delete-automation]').forEach((button) => button.addEventListener('click', () => deleteAutomation(button.closest('.cim-automation-card').dataset.id)));
+  }
+
+  function editAutomation(id) {
+    openWorkflowDesigner(id);
+  }
+
+  async function deleteAutomation(id) {
+    const automation = state.automationById.get(id);
+    if (!automation || !confirm(`Delete !${automation.name} and its workflow?`)) return;
+    await dbRequest('readwrite', (store) => store.delete(id), AUTOMATION_STORE_NAME);
+    await loadAutomations();
+    if (state.editingAutomationId === id) resetAutomationEditor();
+    renderAutomationLibrary();
+    toast(`Deleted !${automation.name}`);
+  }
+
   function ensureComposerButton() {
     const plus = document.querySelector('#composer-plus-btn, [data-testid="composer-plus-btn"]');
     if (!plus || document.querySelector('.cim-library-button')) return;
@@ -771,7 +1633,7 @@
     button.type = 'button';
     button.className = `${plus.className || 'composer-btn'} cim-library-button`;
     button.setAttribute('aria-label', 'Open mentions library');
-    button.title = 'Prompt Forge files and prompt tags';
+    button.title = 'Prompt Forge files, prompt tags, and workflows';
     button.innerHTML = ICONS.file;
     button.addEventListener('click', openModal);
     const host = plus.parentElement?.parentElement || plus.parentElement;
@@ -791,7 +1653,7 @@
     before.selectNodeContents(editor);
     before.setEnd(range.endContainer, range.endOffset);
     const text = before.toString().replace(/\u00a0/g, ' ');
-    const match = text.match(/(?:^|\s)([@#])([A-Za-z0-9_-]*)$/);
+    const match = text.match(/(?:^|\s)([@#!])([A-Za-z0-9_-]*)$/);
     return match ? { trigger: match[1], query: match[2], range } : null;
   }
 
@@ -809,6 +1671,13 @@
     return match ? { trigger: '#', query: match[1], start: caret - match[1].length - 1, end: caret } : null;
   }
 
+  function getAutomationTemplateContext(textarea) {
+    if (!textarea || textarea.selectionStart == null) return null;
+    const caret = textarea.selectionStart;
+    const match = textarea.value.slice(0, caret).match(/(?:^|\s)([@#])([A-Za-z0-9_-]*)$/);
+    return match ? { trigger: match[1], query: match[2], start: caret - match[2].length - 1, end: caret } : null;
+  }
+
   function updateAutocomplete(allowRetry = true) {
     const editor = getEditor();
     const context = editor && getCaretContext(editor);
@@ -821,13 +1690,15 @@
       return closeAutocomplete();
     }
     const query = context.query.toLocaleLowerCase();
-    const kind = context.trigger === '#' ? 'tags' : 'files';
+    const kind = context.trigger === '#' ? 'tags' : context.trigger === '!' ? 'automations' : 'files';
     const matches = kind === 'tags'
       ? state.tags.filter((tag) => tag.nameLower.includes(query))
-      : state.records.filter((record) => record.nicknameLower.includes(query));
+      : kind === 'automations'
+        ? state.automations.filter((automation) => automation.nameLower.includes(query))
+        : state.records.filter((record) => record.nicknameLower.includes(query));
     const items = (query
-      ? (kind === 'tags' ? sortedTags(matches) : sortedRecords(matches))
-      : mostRecentlyUsed(matches, (item) => kind === 'tags' ? item.name : item.nickname)).slice(0, 3);
+      ? (kind === 'tags' ? sortedTags(matches) : kind === 'automations' ? matches : sortedRecords(matches))
+      : mostRecentlyUsed(matches, (item) => kind === 'files' ? item.nickname : item.name)).slice(0, 3);
     if (!items.length) return closeAutocomplete();
     state.autocomplete = { open: true, items, selected: 0, query: context.query, kind, source: 'composer' };
     renderAutocomplete(context.range);
@@ -855,12 +1726,37 @@
     renderAutocomplete(null);
   }
 
+  function updateAutomationTemplateAutocomplete(textarea) {
+    const context = getAutomationTemplateContext(textarea);
+    if (!context) return closeAutocomplete();
+    const query = context.query.toLocaleLowerCase();
+    const kind = context.trigger === '#' ? 'tags' : 'files';
+    const matches = kind === 'tags'
+      ? state.tags.filter((tag) => tag.nameLower.includes(query))
+      : state.records.filter((record) => record.nicknameLower.includes(query));
+    const items = (query
+      ? (kind === 'tags' ? sortedTags(matches) : sortedRecords(matches))
+      : mostRecentlyUsed(matches, (item) => kind === 'tags' ? item.name : item.nickname)).slice(0, 3);
+    if (!items.length) return closeAutocomplete();
+    state.autocomplete = {
+      open: true, items, selected: 0, query: context.query, kind,
+      source: 'automationTemplate', textarea,
+    };
+    renderAutocomplete(null);
+  }
+
   function renderAutocomplete(range) {
     createFloatingUi();
     const menu = document.querySelector('.cim-autocomplete');
     if (!menu) return;
     const isTags = state.autocomplete.kind === 'tags';
-    menu.innerHTML = isTags ? `
+    const isAutomations = state.autocomplete.kind === 'automations';
+    menu.innerHTML = isAutomations ? `
+      <div class="cim-tag-menu-title">${state.autocomplete.query ? 'Matching workflows' : 'Recent & available workflows'}</div>
+      <div class="cim-options">${state.autocomplete.items.map((automation, index) => `
+        <button type="button" class="cim-option" data-index="${index}" aria-selected="${index === state.autocomplete.selected}">
+          <span class="cim-automation-glyph">!</span><span><strong>!${escapeHtml(automation.name)}</strong><small>${escapeHtml(automation.description || `${(automation.nodes || []).length} linked workflow nodes`)}</small></span>
+        </button>`).join('')}</div>` : isTags ? `
       ${state.autocomplete.query ? `<div class="cim-sortbar" aria-label="Sort prompt tags"><span>Sort</span>
         <button type="button" data-tag-sort="name" aria-pressed="${state.tagSortMode === 'name'}">Name</button>
         <button type="button" data-tag-sort="date" aria-pressed="${state.tagSortMode === 'date'}">Date added</button>
@@ -881,10 +1777,12 @@
         </button>`).join('')}</div>`;
     menu.classList.remove('cim-hidden');
     const editor = getEditor();
-    const libraryTextarea = document.querySelector(state.autocomplete.source === 'fileNote' ? '#cim-note' : '#cim-tag-text');
+    const libraryTextarea = state.autocomplete.source === 'automationTemplate'
+      ? state.autocomplete.textarea
+      : document.querySelector(state.autocomplete.source === 'fileNote' ? '#cim-note' : '#cim-tag-text');
     let anchor;
     let surfaceRect;
-    if ((state.autocomplete.source === 'tagEditor' || state.autocomplete.source === 'fileNote') && libraryTextarea) {
+    if (['tagEditor', 'fileNote', 'automationTemplate'].includes(state.autocomplete.source) && libraryTextarea) {
       anchor = libraryTextarea.getBoundingClientRect();
       surfaceRect = anchor;
     } else if (editor && range) {
@@ -914,6 +1812,7 @@
         updateLibrarySortButtons();
         renderLibrary();
         if (state.autocomplete.source === 'tagEditor') updateTagEditorAutocomplete();
+        else if (state.autocomplete.source === 'automationTemplate') updateAutomationTemplateAutocomplete(state.autocomplete.textarea);
         else if (state.autocomplete.source === 'fileNote') updateFileNoteAutocomplete();
         else updateAutocomplete();
       });
@@ -927,6 +1826,7 @@
         updateTagSortButtons();
         renderTagLibrary();
         if (state.autocomplete.source === 'fileNote') updateFileNoteAutocomplete();
+        else if (state.autocomplete.source === 'automationTemplate') updateAutomationTemplateAutocomplete(state.autocomplete.textarea);
         else updateAutocomplete();
       });
     });
@@ -942,12 +1842,18 @@
   function chooseMention(index) {
     const item = state.autocomplete.items[index];
     const isTag = state.autocomplete.kind === 'tags';
-    if (state.autocomplete.source === 'tagEditor' || state.autocomplete.source === 'fileNote') {
+    const isAutomation = state.autocomplete.kind === 'automations';
+    if (['tagEditor', 'fileNote', 'automationTemplate'].includes(state.autocomplete.source)) {
       const isFileNote = state.autocomplete.source === 'fileNote';
-      const textarea = document.querySelector(isFileNote ? '#cim-note' : '#cim-tag-text');
-      const context = isFileNote ? getFileNoteContext(textarea) : getTagEditorContext(textarea);
+      const isAutomationTemplate = state.autocomplete.source === 'automationTemplate';
+      const textarea = isAutomationTemplate
+        ? state.autocomplete.textarea
+        : document.querySelector(isFileNote ? '#cim-note' : '#cim-tag-text');
+      const context = isAutomationTemplate
+        ? getAutomationTemplateContext(textarea)
+        : isFileNote ? getFileNoteContext(textarea) : getTagEditorContext(textarea);
       if (!item || !textarea || !context) return closeAutocomplete();
-      const replacement = isFileNote ? `#${item.name} ` : `@${item.nickname} `;
+      const replacement = context.trigger === '#' ? `#${item.name} ` : `@${item.nickname} `;
       textarea.setRangeText(replacement, context.start, context.end, 'end');
       textarea.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: replacement }));
       closeAutocomplete();
@@ -957,8 +1863,8 @@
     const editor = getEditor();
     const context = editor && getCaretContext(editor);
     if (!item || !context) return closeAutocomplete();
-    const trigger = isTag ? '#' : '@';
-    const name = isTag ? item.name : item.nickname;
+    const trigger = isTag ? '#' : isAutomation ? '!' : '@';
+    const name = isTag || isAutomation ? item.name : item.nickname;
     const selection = getSelection();
     let range = context.range;
     const amount = context.query.length + 1;
@@ -1001,7 +1907,7 @@
     if (!editor) return 0;
     const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
-        return node.parentElement?.closest('.cim-mention, .cim-tag-mention, .cim-sent-mention, .cim-sent-tag')
+        return node.parentElement?.closest('.cim-mention, .cim-tag-mention, .cim-automation-mention, .cim-sent-mention, .cim-sent-tag')
           ? NodeFilter.FILTER_REJECT
           : NodeFilter.FILTER_ACCEPT;
       },
@@ -1012,12 +1918,15 @@
       CHIPPABLE_REFERENCE_RE.lastIndex = 0;
       for (const match of node.data.matchAll(CHIPPABLE_REFERENCE_RE)) {
         const isTag = match[2] === '#';
+        const isAutomation = match[2] === '!';
         const item = isTag
           ? state.tagByName.get(match[3].toLocaleLowerCase())
-          : state.recordByNickname.get(match[3].toLocaleLowerCase());
+          : isAutomation
+            ? state.automationByName.get(match[3].toLocaleLowerCase())
+            : state.recordByNickname.get(match[3].toLocaleLowerCase());
         if (!item) continue;
         const start = match.index + match[1].length;
-        replacements.push({ node, start, end: start + match[2].length + match[3].length, isTag, item });
+        replacements.push({ node, start, end: start + match[2].length + match[3].length, isTag, isAutomation, item });
       }
     }
     for (const replacement of replacements.reverse()) {
@@ -1027,11 +1936,14 @@
       range.setEnd(replacement.node, replacement.end);
       range.deleteContents();
       const chip = document.createElement('span');
-      chip.className = replacement.isTag ? 'cim-tag-mention' : 'cim-mention';
+      chip.className = replacement.isTag ? 'cim-tag-mention' : replacement.isAutomation ? 'cim-automation-mention' : 'cim-mention';
       chip.contentEditable = 'false';
       if (replacement.isTag) {
         chip.dataset.cimTagId = replacement.item.id;
         chip.textContent = `#${replacement.item.name}`;
+      } else if (replacement.isAutomation) {
+        chip.dataset.cimAutomationId = replacement.item.id;
+        chip.textContent = `!${replacement.item.name}`;
       } else {
         chip.dataset.cimId = replacement.item.id;
         chip.textContent = `@${replacement.item.nickname}`;
@@ -1061,10 +1973,15 @@
       if (event.key === 'Escape') { event.preventDefault(); closeAutocomplete(); return; }
     }
     if (event.key === 'Enter' && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.isComposing) {
-      const text = getEditor()?.innerText || '';
-      if (hasStoredMentions(text)) {
+      if (state.automationRun && !state.internalSubmit) {
         event.preventDefault(); event.stopImmediatePropagation();
-        prepareAndSend();
+        toast('Stop the active workflow before sending another prompt.');
+        return;
+      }
+      const text = getEditor()?.innerText || '';
+      if (hasComposerActions(text)) {
+        event.preventDefault(); event.stopImmediatePropagation();
+        submitComposerActions();
       }
     }
   }
@@ -1105,6 +2022,25 @@
       if (tag) found.set(tag.id, tag);
     }
     return [...found.values()];
+  }
+
+  function collectMentionedAutomations(text) {
+    const found = new Map();
+    for (const match of text.matchAll(AUTOMATION_RE)) {
+      const automation = state.automationByName.get(match[2].toLocaleLowerCase());
+      if (automation) found.set(automation.id, automation);
+    }
+    return [...found.values()];
+  }
+
+  function hasComposerActions(text) {
+    return hasStoredMentions(text) || collectMentionedAutomations(text).length > 0;
+  }
+
+  function submitComposerActions() {
+    const text = getEditor()?.innerText || '';
+    if (collectMentionedAutomations(text).length) runAutomationFromComposer();
+    else prepareAndSend();
   }
 
   function randomSample(items, count) {
@@ -1283,7 +2219,7 @@
     try {
       // A selection made entirely of contenteditable="false" chips may make
       // execCommand report success without changing anything. Flatten first.
-      editor.querySelectorAll('.cim-mention, .cim-tag-mention').forEach((chip) => {
+      editor.querySelectorAll('.cim-mention, .cim-tag-mention, .cim-automation-mention').forEach((chip) => {
         chip.replaceWith(document.createTextNode(chip.textContent || ''));
       });
       editor.normalize();
@@ -1321,33 +2257,668 @@
   }
 
   function countAttachmentTiles(form) {
-    return form.querySelectorAll('button[aria-label^="Remove file"], button[aria-label*="Remove file"]').length;
+    return form.querySelectorAll([
+      'button[aria-label*="Remove file" i]',
+      'button[aria-label*="Remove image" i]',
+      'button[aria-label*="Remove attachment" i]',
+      'button[data-testid*="remove"][data-testid*="attachment"]',
+      'button[data-testid*="remove"][data-testid*="file"]',
+    ].join(',')).length;
   }
 
-  async function attachRecords(form, records) {
+  async function attachRecords(form, records, extraFiles = []) {
     const input = form.querySelector('#upload-files, input[type="file"][multiple]');
     if (!input) throw new Error('ChatGPT file input was not found.');
     const before = countAttachmentTiles(form);
     const transfer = new DataTransfer();
-    for (const file of input.files || []) transfer.items.add(file);
+    // ChatGPT keeps accepted attachments in composer state, while its hidden file
+    // input can still expose the files from an earlier selection. Re-dispatching
+    // those stale File objects uploads them again and triggers the duplicate-image
+    // warning. A fresh selection should contain only the files being added now.
     for (const record of records) {
       if (!record?.blob || typeof record.blob.arrayBuffer !== 'function') {
         throw new Error(`The saved file @${record?.nickname || 'unknown'} is unavailable. Re-add it to the library and try again.`);
       }
       transfer.items.add(new File([record.blob], attachmentFileName(record), {
-        type: record.mimeType || record.blob.type || 'application/octet-stream', lastModified: record.lastModified || Date.now(),
+        type: record.mimeType || record.blob.type || 'application/octet-stream', lastModified: Date.now(),
       }));
     }
+    for (const file of extraFiles) transfer.items.add(file);
     input.files = transfer.files;
     input.dispatchEvent(new Event('change', { bubbles: true }));
-    const expected = before + records.length;
+    const expected = before + records.length + extraFiles.length;
     const deadline = Date.now() + 20000;
-    while (Date.now() < deadline) {
-      const send = form.querySelector('#composer-submit-button, [data-testid="send-button"]');
-      if (countAttachmentTiles(form) >= expected && send && !send.disabled) return;
-      await new Promise((resolve) => setTimeout(resolve, 160));
+    try {
+      while (Date.now() < deadline) {
+        const send = form.querySelector('#composer-submit-button, [data-testid="send-button"]');
+        if (countAttachmentTiles(form) >= expected && send && !send.disabled) return;
+        await new Promise((resolve) => setTimeout(resolve, 160));
+      }
+      throw new Error('Timed out while ChatGPT was attaching the saved file.');
+    } finally {
+      // The change handler has already copied this selection into ChatGPT's
+      // composer state. Clearing the native input prevents Prompt Forge files
+      // from leaking into a later web-app upload or being treated as duplicates.
+      try { input.value = ''; } catch (error) { console.warn('[Prompt Forge] Could not clear the upload input', error); }
     }
-    throw new Error('Timed out while ChatGPT was attaching the saved file.');
+  }
+
+  function conversationTurns(role) {
+    const turns = [...document.querySelectorAll(`[data-turn="${role}"]`)];
+    if (turns.length) return turns;
+    return [...document.querySelectorAll(`[data-message-author-role="${role}"]`)];
+  }
+
+  function assistantTurns() {
+    return conversationTurns('assistant');
+  }
+
+  function userTurns() {
+    return conversationTurns('user');
+  }
+
+  function conversationTurnId(turn) {
+    return turn?.dataset.turnId
+      || turn?.closest('[data-turn-id]')?.dataset.turnId
+      || turn?.closest('[data-turn-id-container]')?.dataset.turnIdContainer
+      || '';
+  }
+
+  function generationIsBusy() {
+    return Boolean(document.querySelector(
+      '[data-scroll-root][data-stream-active], #composer-stop-button, [data-testid="stop-button"], button[data-testid*="stop"], button[aria-label="Stop"], button[aria-label="Stop generating"], button[aria-label="Stop streaming"]',
+    ));
+  }
+
+  function automationOutputText(turn) {
+    if (!turn) return '';
+    const clone = turn.cloneNode(true);
+    clone.querySelectorAll('button, [aria-hidden="true"], .sr-only').forEach((node) => node.remove());
+    return (clone.innerText || clone.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  function automationTurnSignature(turn) {
+    if (!turn) return '';
+    const generatedImages = turn.querySelectorAll('img[alt^="Generated image"], [data-testid="image-gen-overlay-actions"]').length;
+    return `${automationOutputText(turn)}|images:${turn.querySelectorAll('img').length}|generated:${generatedImages}|videos:${turn.querySelectorAll('video').length}`;
+  }
+
+  function automationImageIsReady(turn) {
+    if (!turn) return false;
+    if (turn.querySelector('[data-testid="image-gen-overlay-actions"]')) return true;
+    const image = turn.querySelector('img[alt^="Generated image"]');
+    return Boolean(image && image.complete && image.naturalWidth > 0);
+  }
+
+  function automationTurnHasContent(turn) {
+    return Boolean(automationOutputText(turn) || automationImageIsReady(turn) || turn?.querySelector('video, canvas'));
+  }
+
+  function automationGeneratedImage(turn) {
+    const image = turn?.querySelector('img[alt^="Generated image"]');
+    if (!image?.currentSrc && !image?.src) return null;
+    const turnId = turn.dataset.turnId || turn.closest('[data-turn-id]')?.dataset.turnId || shortId();
+    return {
+      src: image.currentSrc || image.src,
+      alt: image.alt || 'Generated image',
+      fileName: `generated-${String(turnId).slice(0, 12)}.png`,
+    };
+  }
+
+  function isTemporaryImageGenerationError(result) {
+    if (!result || result.image) return false;
+    const text = String(result.text || '').replace(/\s+/g, ' ').trim();
+    if (!text) return false;
+    if (/\b(?:content\s+policy|polic(?:y|ies)|safety|guidelines?|not able to help with|can(?:not|['’]?t) help with)\b/i.test(text)) return false;
+    const discussesImageGeneration = /(?:\b(?:generat|creat|produc|render|mak)\w*\b.{0,100}\b(?:images?|pictures?|illustrations?|visuals?)\b|\b(?:images?|pictures?|illustrations?|visuals?)\b.{0,100}\b(?:generat|creat|produc|render)\w*\b)/i.test(text);
+    const reportsFailure = /\b(?:couldn['’]?t|could not|cannot|can['’]?t|unable|wasn['’]?t able|was not able|failed|failure|error|something went wrong)\b/i.test(text);
+    const soundsTemporary = /\b(?:error|failed|failure|something went wrong|technical (?:issue|problem)|temporar\w*|try again|went wrong)\b/i.test(text);
+    return discussesImageGeneration && reportsFailure && soundsTemporary;
+  }
+
+  async function waitForAutomationGeneration(beforeTurns, timeoutMs, run) {
+    const before = new Set(beforeTurns);
+    const beforeSignatures = new Map(beforeTurns.map((turn) => [turn, automationTurnSignature(turn)]));
+    const deadline = Date.now() + timeoutMs;
+    let candidate = null;
+    let signature = '';
+    let stableSince = 0;
+    let candidateSeenAt = 0;
+    while (Date.now() < deadline) {
+      if (run.cancelled) throw new Error('Workflow stopped. The current ChatGPT generation may continue.');
+      const turns = assistantTurns();
+      const last = turns.at(-1);
+      const isNew = last && (
+        !before.has(last)
+        || turns.length > beforeTurns.length
+        || automationTurnSignature(last) !== beforeSignatures.get(last)
+      );
+      if (isNew) {
+        if (candidate !== last) {
+          candidate = last;
+          candidateSeenAt = Date.now();
+        }
+        const nextSignature = automationTurnSignature(candidate);
+        if (nextSignature !== signature) {
+          signature = nextSignature;
+          stableSince = Date.now();
+        }
+        const turnIsStreaming = Boolean(candidate.querySelector('[data-is-streaming="true"], .result-streaming, [class*="streaming"]'));
+        if (!generationIsBusy() && !turnIsStreaming && automationTurnHasContent(candidate)
+          && Date.now() - candidateSeenAt >= 2000 && Date.now() - stableSince >= 1500) {
+          return {
+            text: automationOutputText(candidate),
+            image: automationGeneratedImage(candidate),
+            turnId: candidate.dataset.turnId || '',
+          };
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new Error(`ChatGPT did not finish within ${Math.round(timeoutMs / 60000)} minute(s).`);
+  }
+
+  function renderAutomationTemplate(template, context) {
+    return String(template || '').replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (whole, token) => {
+      const key = token.trim().toLocaleLowerCase();
+      if (key === 'input') return context.input;
+      if (key === 'last') return context.outputs.at(-1) || '';
+      if (key === 'lastimage') return context.lastImage?.fileName || '';
+      if (key === 'item') return context.item ?? '';
+      if (key === 'index') return String(context.index ?? '');
+      if (key === 'itemtotal') return String(context.itemTotal ?? '');
+      if (key === 'iteration') return String(context.iteration);
+      if (key === 'repeattotal') return String(context.repeatTotal);
+      if (key === 'step') return String(context.step);
+      const outputMatch = key.match(/^output:(\d+)$/);
+      if (outputMatch) return context.outputs[Number(outputMatch[1]) - 1] || '';
+      const variableMatch = key.match(/^var:([a-z0-9_-]+)$/);
+      if (variableMatch) {
+        const value = context.variables?.get(variableMatch[1]);
+        return value == null ? '' : typeof value === 'string' ? value : JSON.stringify(value);
+      }
+      const imageMatch = key.match(/^image:([a-z0-9_-]+)$/);
+      if (imageMatch) return context.images?.get(imageMatch[1])?.fileName || '';
+      return whole;
+    });
+  }
+
+  function automationPromptRunCount(automation) {
+    return (automation.nodes || []).reduce((total, node) => {
+      if (node.type === 'prompt') return total + Math.min(50, Math.max(1, Number(node.repeat) || 1));
+      if (node.type === 'foreach' || node.type === 'subflow') return total + 1;
+      return total;
+    }, 0);
+  }
+
+  function showAutomationRunStatus(run, detail, completed = 0, total = 1) {
+    let panel = document.querySelector('.cim-run-status');
+    if (!panel) {
+      panel = document.createElement('section');
+      panel.className = 'cim-run-status';
+      panel.innerHTML = '<header><span class="cim-automation-glyph">!</span><strong></strong><button type="button" class="cim-run-stop">Stop</button></header><p></p><div class="cim-run-progress"><span></span></div>';
+      panel.querySelector('.cim-run-stop').addEventListener('click', () => {
+        if (!state.automationRun) return;
+        state.automationRun.cancelled = true;
+        panel.querySelector('p').textContent = 'Stopping workflow. The current ChatGPT generation may continue.';
+        panel.querySelector('.cim-run-stop').disabled = true;
+        state.automationRun.approvalResolve?.({ action: 'stop' });
+      });
+      document.body.appendChild(panel);
+    }
+    panel.querySelector('strong').textContent = `Running !${run.automation.name}`;
+    panel.querySelector('p').textContent = detail;
+    panel.querySelector('.cim-run-stop').disabled = false;
+    panel.querySelector('.cim-approval-actions')?.remove();
+    panel.querySelector('.cim-run-progress span').style.width = `${Math.min(100, Math.max(0, (completed / Math.max(1, total)) * 100))}%`;
+  }
+
+  function waitForAutomationApproval(run, message) {
+    showAutomationRunStatus(run, message, run.completed, run.total);
+    const panel = document.querySelector('.cim-run-status');
+    const actions = document.createElement('div');
+    actions.className = 'cim-approval-actions';
+    actions.innerHTML = '<button type="button" data-approval="continue">Continue</button><button type="button" data-approval="retry">Retry last</button><button type="button" data-approval="edit">Edit output</button>';
+    panel.appendChild(actions);
+    return new Promise((resolve) => {
+      let finished = false;
+      const finish = (result) => {
+        if (finished) return;
+        finished = true;
+        run.approvalResolve = null;
+        actions.remove();
+        resolve(result);
+      };
+      run.approvalResolve = finish;
+      actions.addEventListener('click', (event) => {
+        const action = event.target.closest('[data-approval]')?.dataset.approval;
+        if (!action) return;
+        if (action === 'edit') {
+          const edited = prompt('Edit the latest output used by later nodes:', run.outputs.at(-1) || '');
+          if (edited == null) return;
+          finish({ action, value: edited });
+          return;
+        }
+        finish({ action });
+      });
+    });
+  }
+
+  async function waitAutomationDelay(seconds, run) {
+    const deadline = Date.now() + seconds * 1000;
+    while (Date.now() < deadline) {
+      if (run.cancelled) throw new Error('Workflow stopped.');
+      await new Promise((resolve) => setTimeout(resolve, Math.min(250, Math.max(0, deadline - Date.now()))));
+    }
+  }
+
+  function referencedAutomationImages(template, run) {
+    const found = new Map();
+    for (const match of String(template || '').matchAll(/\{\{\s*(lastImage|image:([A-Za-z0-9_-]+))\s*\}\}/gi)) {
+      const image = match[1].toLocaleLowerCase() === 'lastimage'
+        ? run.lastImage
+        : run.images.get((match[2] || '').toLocaleLowerCase());
+      if (!image) throw new Error(`${match[0]} does not have a captured generated image yet.`);
+      found.set(image.src, image);
+    }
+    return [...found.values()];
+  }
+
+  async function materializeAutomationImage(image) {
+    if (image.file) return image.file;
+    try {
+      const response = await fetch(image.src, { credentials: 'include' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const blob = await response.blob();
+      image.file = new File([blob], image.fileName, {
+        type: blob.type || 'image/png',
+        lastModified: Date.now(),
+      });
+      return image.file;
+    } catch (error) {
+      throw new Error(`Could not attach ${image.fileName}. ChatGPT did not expose the generated image for reuse (${error.message}).`);
+    }
+  }
+
+  async function prepareAutomationPrompt(promptText, imageReferences = []) {
+    const dependencies = resolvePromptDependencies(promptText);
+    const expansion = expandedPrompt(promptText, dependencies.records, dependencies.tags, dependencies.randomSelections);
+    if (!normalizedEditorText(expansion.text)) throw new Error('A Prompt node expanded to empty text.');
+    const generatedFiles = await Promise.all(imageReferences.map(materializeAutomationImage));
+    return { promptText, dependencies, expansion, generatedFiles, imageReferences };
+  }
+
+  async function sendPreparedAutomationPrompt(sendPackage, automation, run) {
+    if (run.sentCount >= 100) throw new Error('Workflow stopped at the 100-prompt runtime safety limit.');
+    const editor = getEditor();
+    const form = editor?.closest('form');
+    if (!editor || !form) throw new Error('ChatGPT composer was not found.');
+    const { dependencies, expansion, generatedFiles } = sendPackage;
+    const beforeTurns = assistantTurns();
+    const beforeUserTurnIds = new Set(userTurns().map(conversationTurnId).filter(Boolean));
+    if (!setEditorText(editor, expansion.text)) throw new Error('ChatGPT rejected a workflow prompt.');
+    if (dependencies.records.length || generatedFiles.length) await attachRecords(form, dependencies.records, generatedFiles);
+    if (run.cancelled) throw new Error('Workflow stopped before the prompt was sent.');
+    let send = await waitForSendButton(form);
+    if (!editorTextMatches(editor, expansion.text) && !setEditorText(editor, expansion.text)) {
+      throw new Error('ChatGPT reset the composer before the workflow prompt could be sent.');
+    }
+    send = await waitForSendButton(form);
+    const restoration = { expandedText: expansion.text, restorations: expansion.restorations, turnId: '', expiresAt: Date.now() + 10000 };
+    state.pendingPlainRestoration = restoration;
+    state.internalSubmit = true;
+    send.click();
+    run.sentCount += 1;
+    const sent = await markMentionsUsedAfterSend(editor, dependencies.records, dependencies.tags);
+    state.internalSubmit = false;
+    if (!sent) throw new Error('ChatGPT did not accept the workflow prompt.');
+    const sentTurn = [...userTurns()].reverse().find((turn) => {
+      const id = conversationTurnId(turn);
+      return id && !beforeUserTurnIds.has(id);
+    }) || userTurns().at(-1);
+    restoration.turnId = conversationTurnId(sentTurn);
+    if (expansion.restorations.length) rememberHistoryRestoration(restoration);
+    setTimeout(processSentMarkers, 250);
+    return waitForAutomationGeneration(beforeTurns, (automation.timeoutMinutes || 15) * 60000, run);
+  }
+
+  function turnButtonLabel(button) {
+    return `${button?.getAttribute('aria-label') || ''} ${button?.dataset.testid || ''} ${button?.textContent || ''}`.replace(/\s+/g, ' ').trim();
+  }
+
+  function setTurnEditorText(editor, text) {
+    if (!editor) return false;
+    if (editor.matches('textarea, input')) {
+      const prototype = editor.matches('textarea') ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+      if (setter) setter.call(editor, String(text ?? ''));
+      else editor.value = String(text ?? '');
+      dispatchEditorInput(editor, text);
+      return normalizedEditorText(editor.value) === normalizedEditorText(text);
+    }
+    return setEditorText(editor, text);
+  }
+
+  async function retryAutomationPromptByEditing(automation, run, sendPackage) {
+    if (run.sentCount >= 100) throw new Error('Workflow stopped at the 100-prompt runtime safety limit.');
+    const turn = userTurns().at(-1);
+    const edit = turn?.querySelector('button[aria-label="Edit message" i], button[data-testid*="edit" i]');
+    if (!turn || !edit) return null;
+    const beforeTurns = assistantTurns();
+    edit.click();
+    const deadline = Date.now() + 4000;
+    let submit = null;
+    let editor = null;
+    while (Date.now() < deadline) {
+      const buttons = [...turn.querySelectorAll('button')];
+      submit = buttons.find((button) =>
+        !button.disabled
+        && /(?:^|\s)(?:send|submit|save\s*(?:&|and)?\s*submit)(?:\s|$)/i.test(turnButtonLabel(button))
+        && !/\bcancel\b/i.test(turnButtonLabel(button)));
+      editor = turn.querySelector('textarea, [contenteditable="true"]');
+      if (submit && editor) break;
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    }
+    if (!submit || !editor || !setTurnEditorText(editor, sendPackage.expansion.text)) {
+      const cancel = [...turn.querySelectorAll('button')].find((button) => /\bcancel\b/i.test(turnButtonLabel(button)));
+      cancel?.click();
+      return null;
+    }
+    state.internalSubmit = true;
+    try {
+      submit.click();
+      run.sentCount += 1;
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    } finally {
+      state.internalSubmit = false;
+    }
+    return waitForAutomationGeneration(beforeTurns, (automation.timeoutMinutes || 15) * 60000, run);
+  }
+
+  async function sendAutomationPromptWithErrorRetry(promptText, automation, run, imageReferences = [], preparedPackage = null) {
+    const sendPackage = preparedPackage || await prepareAutomationPrompt(promptText, imageReferences);
+    let result = await sendPreparedAutomationPrompt(sendPackage, automation, run);
+    if (!isTemporaryImageGenerationError(result)) return { result, sendPackage };
+    if (!state.retryOnError) {
+      throw new Error('ChatGPT reported a temporary image-generation error. Enable Retry on error in Options to resend failed workflow prompts automatically.');
+    }
+    for (let attempt = 1; attempt <= AUTOMATIC_ERROR_RETRY_LIMIT; attempt += 1) {
+      showAutomationRunStatus(
+        run,
+        `ChatGPT reported an image-generation error. Retrying the same prompt (${attempt}/${AUTOMATIC_ERROR_RETRY_LIMIT})…`,
+        run.completed,
+        run.total,
+      );
+      result = await retryAutomationPromptByEditing(automation, run, sendPackage);
+      if (!result) result = await sendPreparedAutomationPrompt(sendPackage, automation, run);
+      if (!isTemporaryImageGenerationError(result)) return { result, sendPackage };
+    }
+    throw new Error('ChatGPT reported another image-generation error after Prompt Forge retried the same prompt.');
+  }
+
+  function automationContext(run, input, extra = {}) {
+    return {
+      input, outputs: run.outputs, variables: run.variables, images: run.images,
+      lastImage: run.lastImage, iteration: 1, repeatTotal: 1, step: run.promptStep + 1,
+      ...extra,
+    };
+  }
+
+  function rememberAutomationResult(run, result, replaceLast = false) {
+    if (replaceLast && run.outputs.length) run.outputs[run.outputs.length - 1] = result.text || '';
+    else run.outputs.push(result.text || '');
+    if (result.image) run.lastImage = result.image;
+    run.lastResult = result;
+  }
+
+  async function executeAutomationPrompt(template, automation, run, input, extra = {}, replaceLast = false) {
+    if (run.completed >= 100) throw new Error('Workflow stopped at the 100-prompt safety limit.');
+    const context = automationContext(run, input, extra);
+    const promptText = renderAutomationTemplate(template, context);
+    const imageReferences = referencedAutomationImages(template, run);
+    showAutomationRunStatus(run, `Generating prompt ${run.completed + 1}${run.total ? ` of about ${run.total}` : ''}…`, run.completed, run.total);
+    const { result, sendPackage } = await sendAutomationPromptWithErrorRetry(promptText, automation, run, imageReferences);
+    run.lastPrompt = { promptText, automation, imageReferences, sendPackage };
+    rememberAutomationResult(run, result, replaceLast);
+    run.completed += 1;
+    showAutomationRunStatus(run, `Completed ${run.completed} prompt${run.completed === 1 ? '' : 's'}.`, run.completed, run.total);
+    return result;
+  }
+
+  async function retryLastAutomationPrompt(run, replaceLast = true) {
+    if (!run.lastPrompt) throw new Error('There is no previous prompt to retry.');
+    if (run.completed >= 100) throw new Error('Workflow stopped at the 100-prompt safety limit.');
+    run.total += 1;
+    showAutomationRunStatus(run, `Retrying the previous prompt…`, run.completed, run.total);
+    const { result, sendPackage } = await sendAutomationPromptWithErrorRetry(
+      run.lastPrompt.promptText, run.lastPrompt.automation, run, run.lastPrompt.imageReferences, run.lastPrompt.sendPackage,
+    );
+    run.lastPrompt.sendPackage = sendPackage;
+    rememberAutomationResult(run, result, replaceLast);
+    run.completed += 1;
+    return result;
+  }
+
+  function automationConditionMatches(value, operator, expected, run) {
+    const text = String(value ?? '');
+    if (operator === 'image_exists') {
+      const namedImage = [run.lastImage, ...run.images.values()].filter(Boolean)
+        .some((image) => image.fileName === text.trim());
+      return Boolean(run.lastResult?.image || namedImage);
+    }
+    if (operator === 'not_empty') return Boolean(text.trim());
+    if (operator === 'contains') return text.toLocaleLowerCase().includes(String(expected || '').toLocaleLowerCase());
+    if (operator === 'not_contains') return !text.toLocaleLowerCase().includes(String(expected || '').toLocaleLowerCase());
+    if (operator === 'equals') return text.trim().toLocaleLowerCase() === String(expected || '').trim().toLocaleLowerCase();
+    if (operator === 'regex') {
+      try { return new RegExp(expected, 'i').test(text); } catch (error) { throw new Error(`Invalid validation regular expression: ${error.message}`); }
+    }
+    return false;
+  }
+
+  function automationListItems(value) {
+    const text = String(value || '').trim();
+    if (!text) return [];
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return parsed.map((item) => typeof item === 'string' ? item : JSON.stringify(item)).filter(Boolean);
+    } catch (error) {
+      // Plain line-based lists are the common case.
+    }
+    return text.split(/\r?\n/).map((item) => item.replace(/^\s*(?:[-*]|\d+[.)])\s*/, '').trim()).filter(Boolean);
+  }
+
+  function valueAtJsonPath(value, path) {
+    const cleaned = String(value || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    const parsed = JSON.parse(cleaned);
+    return String(path || '').split('.').filter(Boolean).reduce((current, part) => current?.[part], parsed);
+  }
+
+  function extractAutomationValue(node, source) {
+    if (node.mode === 'regex') {
+      let match;
+      try { match = new RegExp(node.pattern, 'is').exec(source); } catch (error) { throw new Error(`Invalid extraction regular expression: ${error.message}`); }
+      if (!match) throw new Error(`Extract Variable could not match /${node.pattern}/.`);
+      return match[1] ?? match[0];
+    }
+    if (node.mode === 'json') {
+      try {
+        const value = valueAtJsonPath(source, node.pattern);
+        if (value === undefined) throw new Error('path was not found');
+        return value;
+      } catch (error) {
+        throw new Error(`Extract Variable could not read JSON path "${node.pattern}": ${error.message}`);
+      }
+    }
+    return source;
+  }
+
+  async function executeAutomationNodes(automation, run, input, depth = 0) {
+    const nodes = Array.isArray(automation.nodes) ? automation.nodes : [];
+    const graphMode = Array.isArray(automation.connections);
+    const connections = graphMode ? sanitizeWorkflowConnections(automation.connections, nodes) : [];
+    const connectionBySlot = new Map(connections.map((connection) => [`${connection.from}:${connection.branch}`, connection]));
+    const nodeIndexById = new Map(nodes.map((node, index) => [node.id, index]));
+    const incoming = new Set(connections.map((connection) => connection.to));
+    let nodeIndex = graphMode ? nodes.findIndex((node) => !incoming.has(node.id)) : 0;
+    if (nodeIndex < 0 && nodes.length) throw new Error('This workflow has no starting node. Remove a connection to break the cycle.');
+    let transitions = 0;
+    while (nodeIndex >= 0 && nodeIndex < nodes.length) {
+      if (++transitions > 500) throw new Error('Workflow stopped after 500 node transitions. Check the graph for an endless loop.');
+      const node = nodes[nodeIndex];
+      if (run.cancelled) throw new Error('Workflow stopped.');
+      let branch = 'next';
+      let legacyAdvance = 1;
+      if (node.type === 'delay') {
+        const seconds = Math.min(3600, Math.max(1, Number(node.seconds) || 1));
+        showAutomationRunStatus(run, `Node ${nodeIndex + 1}: waiting ${seconds} second${seconds === 1 ? '' : 's'}…`, run.completed, run.total);
+        await waitAutomationDelay(seconds, run);
+      } else if (node.type === 'image') {
+        if (!run.lastImage) throw new Error('Generated Image needs a completed image prompt before it.');
+        run.images.set(String(node.name || 'image').toLocaleLowerCase(), run.lastImage);
+        showAutomationRunStatus(run, `Captured ${run.lastImage.fileName} as {{image:${node.name || 'image'}}}.`, run.completed, run.total);
+      } else if (node.type === 'condition') {
+        const source = renderAutomationTemplate(node.source || '{{last}}', automationContext(run, input));
+        const passed = automationConditionMatches(source, node.operator, node.expected, run);
+        branch = passed ? 'true' : 'false';
+        if (graphMode) {
+          showAutomationRunStatus(run, `Condition ${passed ? 'passed' : 'failed'} · following ${branch} connection.`, run.completed, run.total);
+        } else {
+          const action = passed ? node.trueAction : node.falseAction;
+          const skip = passed ? node.trueSkip : node.falseSkip;
+          showAutomationRunStatus(run, `Condition ${passed ? 'passed' : 'failed'} · ${action || 'continue'}.`, run.completed, run.total);
+          if (action === 'stop') return { stopped: true };
+          if (action === 'skip') legacyAdvance += Math.min(50, Math.max(1, Number(skip) || 1));
+        }
+      } else if (node.type === 'approval') {
+        const message = renderAutomationTemplate(node.message || 'Review the latest result before continuing.', automationContext(run, input));
+        const decision = await waitForAutomationApproval(run, message);
+        if (decision.action === 'stop' || run.cancelled) throw new Error('Workflow stopped at an approval checkpoint.');
+        if (decision.action === 'retry') await retryLastAutomationPrompt(run);
+        if (decision.action === 'edit' && run.outputs.length) run.outputs[run.outputs.length - 1] = decision.value;
+      } else if (node.type === 'extract') {
+        const source = renderAutomationTemplate(node.source || '{{last}}', automationContext(run, input));
+        const extracted = extractAutomationValue(node, source);
+        run.variables.set(String(node.name || 'result').toLocaleLowerCase(), extracted);
+        showAutomationRunStatus(run, `Saved {{var:${node.name || 'result'}}}.`, run.completed, run.total);
+      } else if (node.type === 'validate') {
+        let source = renderAutomationTemplate(node.source || '{{last}}', automationContext(run, input));
+        let passed = automationConditionMatches(source, node.operator, node.expected, run);
+        const retries = Math.min(10, Math.max(1, Number(node.retries) || 1));
+        for (let attempt = 1; !passed && attempt <= retries; attempt += 1) {
+          await retryLastAutomationPrompt(run);
+          source = renderAutomationTemplate(node.source || '{{last}}', automationContext(run, input));
+          passed = automationConditionMatches(source, node.operator, node.expected, run);
+        }
+        if (!passed) throw new Error(`Validation failed after ${retries} retr${retries === 1 ? 'y' : 'ies'}.`);
+      } else if (node.type === 'foreach') {
+        const source = renderAutomationTemplate(node.source || '{{input}}', automationContext(run, input));
+        const items = automationListItems(source);
+        if (!items.length) throw new Error('For Each did not receive any list items.');
+        if (items.length > 50) throw new Error('For Each supports at most 50 items per node.');
+        run.total += Math.max(0, items.length - 1);
+        for (let index = 0; index < items.length; index += 1) {
+          run.promptStep += 1;
+          await executeAutomationPrompt(node.template, automation, run, input, {
+            item: items[index], index: index + 1, itemTotal: items.length,
+            iteration: index + 1, repeatTotal: items.length, step: run.promptStep,
+          });
+        }
+      } else if (node.type === 'subflow') {
+        const target = state.automationById.get(node.automationId);
+        if (!target) throw new Error('A Run Workflow node points to a workflow that no longer exists.');
+        if (depth >= 5) throw new Error('Nested workflows are limited to five levels.');
+        if (run.stack.has(target.id)) throw new Error(`Recursive workflow loop detected at !${target.name}.`);
+        const subInput = renderAutomationTemplate(node.input || '{{input}}', automationContext(run, input));
+        run.total += Math.max(0, automationPromptRunCount(target) - 1);
+        run.stack.add(target.id);
+        try {
+          const outcome = await executeAutomationNodes(target, run, subInput, depth + 1);
+          if (outcome?.stopped) return outcome;
+          await markAutomationUsed(target);
+        } finally {
+          run.stack.delete(target.id);
+        }
+      } else {
+        run.promptStep += 1;
+        const repeatTotal = Math.min(50, Math.max(1, Number(node.repeat) || 1));
+        for (let iteration = 1; iteration <= repeatTotal; iteration += 1) {
+          await executeAutomationPrompt(node.template, automation, run, input, {
+            iteration, repeatTotal, step: run.promptStep,
+          });
+        }
+      }
+      if (!graphMode) {
+        nodeIndex += legacyAdvance;
+        continue;
+      }
+      const connection = connectionBySlot.get(`${node.id}:${branch}`);
+      if (!connection) return { stopped: false };
+      const nextIndex = nodeIndexById.get(connection.to);
+      if (nextIndex === undefined) return { stopped: false };
+      nodeIndex = nextIndex;
+    }
+    return { stopped: false };
+  }
+
+  async function markAutomationUsed(automation) {
+    try {
+      let order = Number(localStorage.getItem('cim-usage-sequence')) || 0;
+      automation.lastUsedOrder = ++order;
+      automation.lastUsedAt = Date.now();
+      localStorage.setItem('cim-usage-sequence', String(order));
+      await dbRequest('readwrite', (store) => store.put(automation), AUTOMATION_STORE_NAME);
+    } catch (error) {
+      console.error('[Prompt Forge] Could not save automation usage', error);
+    }
+  }
+
+  async function runAutomationFromComposer() {
+    if (state.automationRun || state.sending) return toast('Another Prompt Forge workflow is already running.');
+    const editor = getEditor();
+    const originalText = (editor?.innerText || editor?.textContent || '').replace(/\u00a0/g, ' ').trim();
+    const automations = collectMentionedAutomations(originalText);
+    if (!editor || automations.length !== 1) return toast(automations.length > 1 ? 'Use one !workflow chip at a time.' : 'Choose a saved !workflow.');
+    const automation = automations[0];
+    let removedTrigger = false;
+    const input = originalText.replace(AUTOMATION_RE, (whole, prefix, name) => {
+      if (removedTrigger || name.toLocaleLowerCase() !== automation.nameLower) return whole;
+      removedTrigger = true;
+      return prefix;
+    }).replace(/[ \t]{2,}/g, ' ').trim();
+    const nodes = Array.isArray(automation.nodes) ? automation.nodes : [];
+    if (!nodes.some((node) => ['prompt', 'foreach', 'subflow'].includes(node.type))) return toast(`!${automation.name} has no prompt-producing nodes.`);
+    const run = {
+      automation, cancelled: false, outputs: [], variables: new Map(), images: new Map(),
+      lastImage: null, lastResult: null, lastPrompt: null, sentCount: 0,
+      completed: 0, total: automationPromptRunCount(automation), promptStep: 0,
+      stack: new Set([automation.id]), approvalResolve: null,
+    };
+    state.automationRun = run;
+    closeAutocomplete();
+    document.querySelectorAll('.cim-library-button').forEach((button) => button.classList.add('cim-sending'));
+    setEditorText(editor, '');
+    if (run.total > 100) {
+      state.automationRun = null;
+      document.querySelectorAll('.cim-sending').forEach((node) => node.classList.remove('cim-sending'));
+      setEditorText(editor, originalText);
+      return toast('This workflow exceeds the 100-prompt safety limit. Edit it before running.');
+    }
+    try {
+      showAutomationRunStatus(run, 'Starting workflow…', run.completed, run.total);
+      await executeAutomationNodes(automation, run, input);
+      await markAutomationUsed(automation);
+      toast(`!${automation.name} completed ${run.completed} prompt${run.completed === 1 ? '' : 's'}`);
+    } catch (error) {
+      console.error('[Prompt Forge] Workflow stopped', error);
+      if (!run.sentCount && editor.isConnected) setEditorText(editor, originalText);
+      toast(error.message || `!${automation.name} stopped.`);
+    } finally {
+      state.internalSubmit = false;
+      state.automationRun = null;
+      document.querySelector('.cim-run-status')?.remove();
+      document.querySelectorAll('.cim-sending').forEach((node) => node.classList.remove('cim-sending'));
+    }
   }
 
   async function prepareAndSend() {
@@ -1375,9 +2946,11 @@
         throw new Error('ChatGPT reset the composer before the expanded prompt could be sent.');
       }
       send = await waitForSendButton(form);
+      const beforeUserTurnIds = new Set(userTurns().map(conversationTurnId).filter(Boolean));
       const restoration = {
         expandedText: expansion.text,
         restorations: expansion.restorations,
+        turnId: '',
         expiresAt: Date.now() + 10000,
       };
       state.pendingPlainRestoration = restoration;
@@ -1385,7 +2958,14 @@
       send.click();
       void markMentionsUsedAfterSend(editor, records, tags)
         .then((sent) => {
-          if (sent) rememberHistoryRestoration(restoration);
+          if (sent) {
+            const sentTurn = [...userTurns()].reverse().find((turn) => {
+              const id = conversationTurnId(turn);
+              return id && !beforeUserTurnIds.has(id);
+            }) || userTurns().at(-1);
+            restoration.turnId = conversationTurnId(sentTurn);
+            rememberHistoryRestoration(restoration);
+          }
           else {
             if (state.pendingPlainRestoration === restoration) state.pendingPlainRestoration = null;
             console.warn('[Prompt Forge] ChatGPT did not clear the composer after the send attempt.');
@@ -1412,20 +2992,32 @@
   function interceptClick(event) {
     const send = event.target.closest?.('#composer-submit-button, [data-testid="send-button"]');
     if (!send || state.internalSubmit) return;
+    if (state.automationRun) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      toast('Stop the active workflow before sending another prompt.');
+      return;
+    }
     const editor = getEditor();
-    if (!hasStoredMentions(editor?.innerText || '')) return;
+    if (!hasComposerActions(editor?.innerText || '')) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    prepareAndSend();
+    submitComposerActions();
   }
 
   function interceptSubmit(event) {
     if (state.internalSubmit || !event.target.matches?.('form')) return;
+    if (state.automationRun) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      toast('Stop the active workflow before sending another prompt.');
+      return;
+    }
     const editor = event.target.querySelector('#prompt-textarea[contenteditable="true"], div.ProseMirror[contenteditable="true"]');
-    if (!editor || !hasStoredMentions(editor.innerText || '')) return;
+    if (!editor || !hasComposerActions(editor.innerText || '')) return;
     event.preventDefault();
     event.stopImmediatePropagation();
-    prepareAndSend();
+    submitComposerActions();
   }
 
   function createSentFileChip(nickname, note = '', id = '', expanded = '') {
@@ -1539,9 +3131,13 @@
       state.pendingPlainRestoration = null;
       return;
     }
-    const messages = [...root.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]')];
-    const message = messages.at(-1);
+    const messages = userTurns().filter((turn) => root === document || root.contains(turn));
+    const message = pending.turnId
+      ? messages.find((turn) => conversationTurnId(turn) === pending.turnId)
+      : messages.at(-1);
     if (!message || !findPlainText(readRestorableText(message), pending.expandedText)) return;
+    pending.turnId = pending.turnId || conversationTurnId(message);
+    rememberHistoryRestoration(pending);
     const remaining = [];
     for (const item of pending.restorations) {
       const chip = item.kind === 'tag'
@@ -1554,7 +3150,7 @@
 
   function restoreStoredHistoryReferences(root) {
     if (!state.historyRestorations.length) return;
-    const messages = [...root.querySelectorAll('[data-message-author-role="user"], article[data-turn="user"]')];
+    const messages = userTurns().filter((turn) => root === document || root.contains(turn));
     for (const message of messages) {
       if (message.dataset.cimEditingExpanded === 'true') continue;
       const editables = [
@@ -1563,16 +3159,19 @@
       ];
       for (const editable of editables) {
         if (editable.querySelector('.cim-sent-mention, .cim-sent-tag')) continue;
-        restoreHistoryIntoElement(editable);
+        restoreHistoryIntoElement(editable, message);
       }
       if (editables.length || message.querySelector('.cim-sent-mention, .cim-sent-tag')) continue;
-      restoreHistoryIntoElement(message);
+      restoreHistoryIntoElement(message, message);
     }
   }
 
-  function restoreHistoryIntoElement(element) {
+  function restoreHistoryIntoElement(element, message) {
+    const turnId = conversationTurnId(message);
+    if (!turnId) return false;
     const text = readRestorableText(element);
-    const restoration = state.historyRestorations.find((entry) => findPlainText(text, entry.expandedText));
+    const restoration = state.historyRestorations.find((entry) =>
+      entry.turnId === turnId && findPlainText(text, entry.expandedText));
     if (!restoration) return false;
     let restored = false;
     for (const item of restoration.restorations) {
@@ -1722,6 +3321,17 @@
   function showTooltip(target) {
     clearTimeout(state.tooltipTimer);
     createFloatingUi();
+    if (target.matches('.cim-automation-mention')) {
+      const automation = state.automationById.get(target.dataset.cimAutomationId)
+        || state.automationByName.get(target.textContent.replace(/^!/, '').toLocaleLowerCase());
+      const tooltip = document.querySelector('.cim-tooltip');
+      if (!tooltip) return;
+      const promptCount = automation ? automationPromptRunCount(automation) : 0;
+      tooltip.innerHTML = `<strong>!${escapeHtml(automation?.name || target.textContent.replace(/^!/, ''))}</strong><p>${escapeHtml(automation?.description || 'Saved workflow')}${automation ? `\n\n${automation.nodes.length} linked nodes · ${promptCount} prompt run${promptCount === 1 ? '' : 's'}` : ''}</p>`;
+      tooltip.classList.remove('cim-hidden');
+      positionTooltip(tooltip, target);
+      return;
+    }
     if (target.matches('.cim-tag-mention, .cim-sent-tag')) {
       const tag = state.tagById.get(target.dataset.cimTagId) || state.tagByName.get((target.dataset.cimTagName || target.textContent.slice(1)).toLocaleLowerCase());
       const name = tag?.name || target.dataset.cimTagName || target.textContent.replace(/^#/, '');
@@ -1819,11 +3429,15 @@
       } else if (event.target.matches?.('#cim-note')) {
         clearTimeout(state.autocompleteTimer);
         state.autocompleteTimer = setTimeout(() => { state.autocompleteTimer = null; updateFileNoteAutocomplete(event.target); }, 20);
+      } else if (event.target.matches?.('#cim-automation-nodes [data-node-template]')) {
+        clearTimeout(state.autocompleteTimer);
+        state.autocompleteTimer = setTimeout(() => { state.autocompleteTimer = null; updateAutomationTemplateAutocomplete(event.target); }, 20);
       }
     }, true);
     document.addEventListener('keydown', (event) => {
       if (event.target.matches?.('#cim-tag-text')) { handleLibraryTextareaKeydown(event, 'tagEditor'); return; }
       if (event.target.matches?.('#cim-note')) { handleLibraryTextareaKeydown(event, 'fileNote'); return; }
+      if (event.target.matches?.('#cim-automation-nodes [data-node-template]')) { handleLibraryTextareaKeydown(event, 'automationTemplate'); return; }
       if (event.target.closest?.('#prompt-textarea[contenteditable="true"], div.ProseMirror[contenteditable="true"]')) handleEditorKeydown(event);
       if (event.key === 'Escape' && !document.querySelector('.cim-modal-backdrop')?.classList.contains('cim-hidden')) closeModal();
     }, true);
@@ -1840,11 +3454,11 @@
     }, true);
     document.addEventListener('submit', interceptSubmit, true);
     document.addEventListener('mouseover', (event) => {
-      const mention = event.target.closest?.('.cim-mention, .cim-sent-mention, .cim-tag-mention, .cim-sent-tag');
+      const mention = event.target.closest?.('.cim-mention, .cim-sent-mention, .cim-tag-mention, .cim-sent-tag, .cim-automation-mention');
       if (mention) showTooltip(mention);
     });
     document.addEventListener('mouseout', (event) => {
-      const mention = event.target.closest?.('.cim-mention, .cim-sent-mention, .cim-tag-mention, .cim-sent-tag');
+      const mention = event.target.closest?.('.cim-mention, .cim-sent-mention, .cim-tag-mention, .cim-sent-tag, .cim-automation-mention');
       if (mention && !mention.contains(event.relatedTarget)) scheduleHideTooltip();
     });
     document.addEventListener('scroll', () => { scheduleHideTooltip(); }, true);
@@ -1855,7 +3469,7 @@
     ensureUserscriptUi();
     bindGlobalEvents();
     loadHistoryRestorations();
-    try { await Promise.all([loadRecords(), loadTags()]); } catch (error) { console.error('[Prompt Forge] Storage initialization failed', error); toast('Prompt Forge could not open browser storage.'); }
+    try { await Promise.all([loadRecords(), loadTags(), loadAutomations()]); } catch (error) { console.error('[Prompt Forge] Storage initialization failed', error); toast('Prompt Forge could not open browser storage.'); }
     ensureComposerButton();
     hydrateStoredReferences(getEditor());
     processSentMarkers();
